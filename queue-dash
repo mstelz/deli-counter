@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Live terminal dashboard for the run-queued work queue.
+
+run-queued keeps its state as plain files in $AGENT_QUEUE_DIR (default /tmp/agent-queue):
+  slot-N.info    "pid P · label · HH:MM:SS · command" while slot N is running, empty when free
+  wait-P.info    the same line for a queued run, suffixed " (checkout)" when it waits on its
+                 own checkout's lock rather than on a machine-wide slot
+A killed run can leave either file behind, so an entry counts only while its pid is alive and
+is still a run-queued process. The dashboard never touches the locks: it only reads.
+
+Beyond what `run-queued --status` prints, it measures from /proc: real run and wait times, the
+CPU and memory of each run's whole process tree, machine load and memory, and a history of
+runs that finished while the dashboard was open.
+
+Usage: queue-dash [--interval SECONDS] [--once]
+Keys:  q / Esc quit · r refresh now · + / - change the refresh interval
+"""
+
+import argparse
+import curses
+import os
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+
+QUEUE_DIR = os.environ.get("AGENT_QUEUE_DIR", "/tmp/agent-queue")
+DEFAULT_SLOTS = int(os.environ.get("AGENT_QUEUE_SLOTS", "2"))
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
+
+
+# ---------------------------------------------------------------- /proc sampling
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    ticks: int  # utime + stime
+    start: float  # epoch seconds
+    rss: int  # bytes
+
+
+def boot_time():
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("btime "):
+                return int(line.split()[1])
+    return 0
+
+
+BOOT = boot_time()
+
+
+def read_procs():
+    procs = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        # The command name (field 2) may hold spaces and parens; split after its last ')'.
+        rest = raw[raw.rfind(")") + 2 :].split()
+        procs[int(name)] = Proc(
+            pid=int(name),
+            ppid=int(rest[1]),
+            ticks=int(rest[11]) + int(rest[12]),
+            start=BOOT + int(rest[19]) / CLK_TCK,
+            rss=int(rest[21]) * PAGE,
+        )
+    return procs
+
+
+def children_map(procs):
+    kids = {}
+    for p in procs.values():
+        kids.setdefault(p.ppid, []).append(p.pid)
+    return kids
+
+
+def tree(pid, kids):
+    out, stack = [], [pid]
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, ()))
+    return out
+
+
+def is_run_queued(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"run-queued" in f.read()
+    except OSError:
+        return False
+
+
+def checkout_of(pid):
+    """The checkout run-queued keys its per-checkout lock on: git toplevel of its cwd, else cwd."""
+    try:
+        d = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+    probe = d
+    while True:
+        if os.path.exists(os.path.join(probe, ".git")):
+            return probe
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return d
+        probe = parent
+
+
+def machine():
+    load = os.getloadavg()
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) * 1024
+    return {
+        "load": load,
+        "mem_total": mem.get("MemTotal", 0),
+        "mem_avail": mem.get("MemAvailable", 0),
+        "swap_used": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
+        "swap_total": mem.get("SwapTotal", 0),
+    }
+
+
+# ---------------------------------------------------------------- queue state
+
+
+@dataclass
+class Entry:
+    pid: int
+    label: str
+    command: str
+    submitted: float  # when run-queued started (epoch)
+    checkout_wait: bool = False
+    slot: int = 0
+    run_start: float = 0.0  # when the command itself started (epoch), slots only
+    checkout: str = ""
+    blocked_by: int = 0  # slot holding this waiter's checkout, if any
+    cpu: float = 0.0  # percent of one core
+    rss: int = 0
+    nprocs: int = 0
+
+
+def parse_info(text):
+    """'pid P · label · HH:MM:SS · command' -> (pid, label, command, checkout)."""
+    parts = text.strip().split(" · ", 3)
+    if len(parts) < 4 or not parts[0].startswith("pid "):
+        return None
+    cmd, checkout = parts[3], False
+    if cmd.endswith(" (checkout)"):
+        cmd, checkout = cmd[: -len(" (checkout)")], True
+    try:
+        pid = int(parts[0][4:])
+    except ValueError:
+        return None
+    return pid, parts[1], cmd, checkout
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def slot_count():
+    n = DEFAULT_SLOTS
+    try:
+        for name in os.listdir(QUEUE_DIR):
+            if name.startswith("slot-") and name.endswith(".lock"):
+                try:
+                    n = max(n, int(name[5:-5]))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return n
+
+
+@dataclass
+class Snapshot:
+    at: float
+    nslots: int
+    slots: dict  # slot number -> Entry or None
+    waiting: list
+    machine: dict
+    ok: bool = True
+
+
+@dataclass
+class Sampler:
+    prev_ticks: dict = field(default_factory=dict)
+    prev_at: float = 0.0
+    running: dict = field(default_factory=dict)  # run-queued pid -> Entry, to detect finishes
+    history: deque = field(default_factory=lambda: deque(maxlen=50))
+
+    def sample(self):
+        now = time.time()
+        ok = os.path.isdir(QUEUE_DIR)
+        procs = read_procs()
+        kids = children_map(procs)
+        dt = now - self.prev_at if self.prev_at else 0.0
+        ticks_now = {}
+
+        def measure(e):
+            pids = [p for p in tree(e.pid, kids) if p in procs]
+            e.nprocs = len(pids) - 1  # not counting run-queued itself
+            e.rss = sum(procs[p].rss for p in pids)
+            total = 0
+            for p in pids:
+                ticks_now[p] = procs[p].ticks
+                if dt and p in self.prev_ticks:
+                    total += max(0, procs[p].ticks - self.prev_ticks[p])
+            e.cpu = 100.0 * total / CLK_TCK / dt if dt else 0.0
+            direct = [procs[c].start for c in kids.get(e.pid, ()) if c in procs]
+            e.run_start = min(direct) if direct else now
+
+        nslots = slot_count()
+        slots = {}
+        for i in range(1, nslots + 1):
+            info = parse_info(read_file(os.path.join(QUEUE_DIR, f"slot-{i}.info")))
+            if info and info[0] in procs and is_run_queued(info[0]):
+                pid, label, cmd, _ = info
+                e = Entry(pid, label, cmd, procs[pid].start, slot=i, checkout=checkout_of(pid) or "")
+                measure(e)
+                slots[i] = e
+            else:
+                slots[i] = None
+
+        waiting = []
+        try:
+            names = os.listdir(QUEUE_DIR) if ok else []
+        except OSError:
+            names = []
+        for name in names:
+            if not (name.startswith("wait-") and name.endswith(".info")):
+                continue
+            info = parse_info(read_file(os.path.join(QUEUE_DIR, name)))
+            if not info or info[0] not in procs or not is_run_queued(info[0]):
+                continue
+            pid, label, cmd, checkout = info
+            if any(s and s.pid == pid for s in slots.values()):
+                continue  # between taking a slot and removing its wait file
+            e = Entry(pid, label, cmd, procs[pid].start, checkout_wait=checkout,
+                      checkout=checkout_of(pid) or "")
+            if checkout:
+                e.blocked_by = next((s.slot for s in slots.values()
+                                     if s and s.checkout and s.checkout == e.checkout), 0)
+            waiting.append(e)
+        waiting.sort(key=lambda e: e.submitted)
+
+        live = {e.pid: e for e in slots.values() if e}
+        for pid, e in self.running.items():
+            if pid not in live:
+                self.history.appendleft((now, e))
+        self.running = live
+        self.prev_ticks, self.prev_at = ticks_now, now
+        return Snapshot(now, nslots, slots, waiting, machine(), ok)
+
+
+# ---------------------------------------------------------------- formatting
+
+
+def dur(seconds):
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{s % 3600 // 60:02d}m"
+
+
+def size(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit in ("B", "K", "M") else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n}"
+
+
+def clock(epoch):
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
+
+
+def lines_for(snap, sampler):
+    """Build the screen as a list of rows; each row is a list of (text, style) spans.
+    Styles: 'title', 'dim', 'busy', 'free', 'warn', 'bad', 'wait', 'check', ''."""
+    rows = []
+    m = snap.machine
+    busy = sum(1 for e in snap.slots.values() if e)
+    load1 = m["load"][0]
+    load_style = "bad" if load1 > NCPU * 1.5 else "warn" if load1 > NCPU else ""
+    avail_frac = m["mem_avail"] / m["mem_total"] if m["mem_total"] else 1
+    mem_style = "bad" if avail_frac < 0.1 else "warn" if avail_frac < 0.25 else ""
+    swap = []
+    if m["swap_total"]:
+        sw_frac = m["swap_used"] / m["swap_total"]
+        swap = [("  swap ", "dim"), (f"{size(m['swap_used'])}/{size(m['swap_total'])}",
+                                    "bad" if sw_frac > 0.8 else "warn" if sw_frac > 0.4 else "")]
+
+    rows.append([
+        (" run-queued ", "title"),
+        (f"  {busy}/{snap.nslots} slots busy", "busy" if busy == snap.nslots else "free"),
+        (f"  {len(snap.waiting)} waiting", "wait" if snap.waiting else "dim"),
+        ("   load ", "dim"),
+        (" ".join(f"{x:.1f}" for x in m["load"]), load_style),
+        (f" /{NCPU}", "dim"),
+        ("  mem avail ", "dim"),
+        (f"{size(m['mem_avail'])}/{size(m['mem_total'])}", mem_style),
+        *swap,
+        (f"   {clock(snap.at)}", "dim"),
+    ])
+    if not snap.ok:
+        rows.append([(f" queue dir {QUEUE_DIR} does not exist yet (nothing has queued)", "warn")])
+    rows.append([])
+
+    rows.append([(" SLOTS", "title")])
+    for i in range(1, snap.nslots + 1):
+        e = snap.slots[i]
+        if not e:
+            rows.append([(f"  {i} ", ""), ("○ free", "free")])
+            continue
+        queued_for = e.run_start - e.submitted
+        rows.append([
+            (f"  {i} ", ""),
+            ("● ", "busy"),
+            (f"{e.label:<24.24} ", "busy"),
+            ("ran ", "dim"), (f"{dur(snap.at - e.run_start):>7}", ""),
+            ("  queued ", "dim"), (f"{dur(queued_for):>6}", "dim"),
+            ("  cpu ", "dim"),
+            (f"{e.cpu:>5.0f}%", "bad" if e.cpu > 800 else "warn" if e.cpu > 400 else ""),
+            ("  rss ", "dim"), (f"{size(e.rss):>6}", ""),
+            ("  procs ", "dim"), (f"{e.nprocs}", ""),
+            (f"  pid {e.pid}", "dim"),
+        ])
+        rows.append([("      ", ""), (e.command, "dim")])
+    rows.append([])
+
+    rows.append([(f" WAITING ({len(snap.waiting)})", "title"),
+                 ("   oldest first; slot waiters poll every few seconds, so order is a guide", "dim")])
+    if not snap.waiting:
+        rows.append([("  nothing queued", "dim")])
+    for n, e in enumerate(snap.waiting, 1):
+        rows.append([
+            (f"  #{n:<2} ", ""),
+            (f"{e.label:<24.24} ", "wait"),
+            ("waiting ", "dim"), (f"{dur(snap.at - e.submitted):>7}", ""),
+            ("  on ", "dim"),
+            ("a slot" if not e.checkout_wait
+             else f"its checkout (slot {e.blocked_by})" if e.blocked_by
+             else "its checkout", "check" if e.checkout_wait else ""),
+            (f"  pid {e.pid}", "dim"),
+        ])
+        rows.append([("      ", ""), (e.command, "dim")])
+    rows.append([])
+
+    rows.append([(" FINISHED ", "title"), ("since this dashboard opened", "dim")])
+    if not sampler.history:
+        rows.append([("  none yet", "dim")])
+    for ended, e in sampler.history:
+        rows.append([
+            (f"  {clock(ended)} ", "dim"),
+            (f"{e.label:<24.24} ", ""),
+            ("ran ", "dim"), (f"{dur(ended - e.run_start):>7}", ""),
+            ("  queued ", "dim"), (f"{dur(e.run_start - e.submitted):>6}  ", "dim"),
+            (e.command, "dim"),
+        ])
+    return rows
+
+
+# ---------------------------------------------------------------- output
+
+
+def print_once():
+    s = Sampler()
+    s.sample()
+    time.sleep(0.5)  # a second sample so cpu% has an interval to measure
+    snap = s.sample()
+    for row in lines_for(snap, s):
+        print("".join(text for text, _ in row))
+
+
+def run_curses(stdscr, interval):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    pairs = {"title": curses.COLOR_CYAN, "busy": curses.COLOR_GREEN, "free": curses.COLOR_BLUE,
+             "warn": curses.COLOR_YELLOW, "bad": curses.COLOR_RED, "wait": curses.COLOR_MAGENTA,
+             "check": curses.COLOR_YELLOW}
+    styles = {"": curses.A_NORMAL, "dim": curses.A_DIM}
+    for n, (name, color) in enumerate(pairs.items(), 1):
+        curses.init_pair(n, color, -1)
+        styles[name] = curses.color_pair(n) | (curses.A_BOLD if name in ("title", "bad") else 0)
+
+    sampler = Sampler()
+    snap = sampler.sample()
+    next_at = time.time() + interval
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        rows = lines_for(snap, sampler)
+        for y, row in enumerate(rows[: h - 1]):
+            x = 0
+            for text, style in row:
+                if x >= w - 1:
+                    break
+                text = text[: w - 1 - x]
+                try:
+                    stdscr.addstr(y, x, text, styles.get(style, 0))
+                except curses.error:
+                    pass
+                x += len(text)
+        footer = f" q quit · r refresh · +/- interval ({interval:g}s) · {QUEUE_DIR} "
+        if len(rows) > h - 1:
+            footer += f"· {len(rows) - h + 1} rows hidden, enlarge the terminal "
+        try:
+            stdscr.addstr(h - 1, 0, footer[: w - 1], curses.A_REVERSE)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        stdscr.timeout(max(50, int((next_at - time.time()) * 1000)))
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return
+        if key in (ord("+"), ord("=")):
+            interval = min(30.0, interval * 2)
+        elif key in (ord("-"), ord("_")):
+            interval = max(0.25, interval / 2)
+        if key == ord("r") or time.time() >= next_at:
+            snap = sampler.sample()
+            next_at = time.time() + interval
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Live dashboard for the run-queued work queue.")
+    ap.add_argument("-n", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    args = ap.parse_args()
+    if args.once or not sys.stdout.isatty():
+        print_once()
+        return
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(run_curses, max(0.25, args.interval))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
