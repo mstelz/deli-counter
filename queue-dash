@@ -5,42 +5,55 @@ run-queued keeps its state as plain files in $AGENT_QUEUE_DIR (default /tmp/agen
   slot-N.info    "pid P · label · HH:MM:SS · command" while slot N is running, empty when free
   wait-P.info    the same line for a queued run, suffixed " (checkout)" when it waits on its
                  own checkout's lock rather than on a machine-wide slot
+  slots          the live slot count, if set; run-queued re-reads it on every poll
 A killed run can leave either file behind, so an entry counts only while its pid is alive and
-is still a run-queued process. The dashboard never touches the locks: it only reads.
+is still a run-queued process. The dashboard never touches the locks. The one thing it writes is
+the slots file, when you change the slot count.
 
-Beyond what `run-queued --status` prints, it measures from /proc: real run and wait times, the
-CPU and memory of each run's whole process tree, machine load and memory, and a history of
-runs that finished while the dashboard was open.
+Beyond what `run-queued --status` prints, it measures real run and wait times, the CPU and
+memory of each run's whole process tree, machine load and memory, and a history of runs that
+finished while the dashboard was open. Linux and macOS; Python 3 standard library only.
 
 Usage: queue-dash [--interval SECONDS] [--once]
-Keys:  q / Esc quit · r refresh now · + / - change the refresh interval
+Keys:  ? help · q quit · r refresh now · + / - slot count · [ / ] refresh interval
+       Tab browse finished runs (↑↓ PgUp PgDn Home End, Enter details, Esc back)
 """
 
 import argparse
 import curses
 import os
+import re
+import subprocess
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
 QUEUE_DIR = os.environ.get("AGENT_QUEUE_DIR", "/tmp/agent-queue")
+SLOTS_FILE = os.path.join(QUEUE_DIR, "slots")
 DEFAULT_SLOTS = int(os.environ.get("AGENT_QUEUE_SLOTS", "2"))
+MAX_SLOTS = 64
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 NCPU = os.cpu_count() or 1
 
 
-# ---------------------------------------------------------------- /proc sampling
+# ---------------------------------------------------------------- process and machine sampling
+#
+# Linux reads /proc directly. macOS has no /proc, so it asks ps, lsof, vm_stat and sysctl, which
+# ship with the OS. Either way the rest of the dashboard sees the same Proc and machine() values.
+
+LINUX = sys.platform.startswith("linux")
 
 
 @dataclass
 class Proc:
     pid: int
     ppid: int
-    ticks: int  # utime + stime
+    cpu: float  # CPU seconds used so far (user + system)
     start: float  # epoch seconds
     rss: int  # bytes
+    args: str = ""  # command line; filled on macOS only, Linux reads it on demand
 
 
 def boot_time():
@@ -51,10 +64,17 @@ def boot_time():
     return 0
 
 
-BOOT = boot_time()
+BOOT = boot_time() if LINUX else 0
 
 
-def read_procs():
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def read_procs_linux():
     procs = {}
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -69,11 +89,39 @@ def read_procs():
         procs[int(name)] = Proc(
             pid=int(name),
             ppid=int(rest[1]),
-            ticks=int(rest[11]) + int(rest[12]),
+            cpu=(int(rest[11]) + int(rest[12])) / CLK_TCK,
             start=BOOT + int(rest[19]) / CLK_TCK,
             rss=int(rest[21]) * PAGE,
         )
     return procs
+
+
+def ps_duration(text):
+    """ps times: '[[DD-]HH:]MM:SS' (etime, Linux cputime) or 'MM:SS.ss' (macOS cputime)."""
+    days, _, text = text.rpartition("-")
+    secs = 0.0
+    for part in text.split(":"):
+        secs = secs * 60 + float(part)
+    return (int(days) if days else 0) * 86400 + secs
+
+
+def read_procs_ps():
+    now = time.time()
+    procs = {}
+    for line in run("ps", "-axo", "pid=,ppid=,rss=,time=,etime=,args=").splitlines():
+        f = line.split(None, 5)
+        try:
+            pid, ppid, rss = int(f[0]), int(f[1]), int(f[2]) * 1024
+            cpu, age = ps_duration(f[3]), ps_duration(f[4])
+        except (ValueError, IndexError):
+            continue
+        # etime has whole seconds, so this start can be up to a second early.
+        procs[pid] = Proc(pid, ppid, cpu, now - age, rss, f[5] if len(f) > 5 else "")
+    return procs
+
+
+def read_procs():
+    return read_procs_linux() if LINUX else read_procs_ps()
 
 
 def children_map(procs):
@@ -92,7 +140,9 @@ def tree(pid, kids):
     return out
 
 
-def is_run_queued(pid):
+def is_run_queued(pid, procs):
+    if not LINUX:
+        return "run-queued" in procs[pid].args
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             return b"run-queued" in f.read()
@@ -100,36 +150,92 @@ def is_run_queued(pid):
         return False
 
 
+def cwd_of(pid):
+    if LINUX:
+        try:
+            return os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return None
+    # lsof -F prints one field per line; the cwd's path is the line starting with 'n'.
+    for line in run("lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn").splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+
+_checkouts = {}  # pid -> checkout; a run's cwd never changes, and lsof is slow on macOS
+
+
 def checkout_of(pid):
     """The checkout run-queued keys its per-checkout lock on: git toplevel of its cwd, else cwd."""
-    try:
-        d = os.readlink(f"/proc/{pid}/cwd")
-    except OSError:
+    if pid in _checkouts:
+        return _checkouts[pid]
+    d = cwd_of(pid)
+    if d is None:
         return None
     probe = d
-    while True:
-        if os.path.exists(os.path.join(probe, ".git")):
-            return probe
+    while not os.path.exists(os.path.join(probe, ".git")):
         parent = os.path.dirname(probe)
         if parent == probe:
-            return d
+            probe = d
+            break
         probe = parent
+    _checkouts[pid] = probe
+    return probe
 
 
-def machine():
-    load = os.getloadavg()
+def forget_checkouts(live_pids):
+    for pid in [p for p in _checkouts if p not in live_pids]:
+        del _checkouts[pid]
+
+
+def machine_linux():
     mem = {}
     with open("/proc/meminfo") as f:
         for line in f:
             k, v = line.split(":", 1)
             mem[k] = int(v.split()[0]) * 1024
     return {
-        "load": load,
         "mem_total": mem.get("MemTotal", 0),
         "mem_avail": mem.get("MemAvailable", 0),
         "swap_used": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
         "swap_total": mem.get("SwapTotal", 0),
     }
+
+
+def parse_vm_stat(text):
+    """Available memory from vm_stat: free, inactive and speculative pages, which macOS hands
+    out without swapping."""
+    m = re.search(r"page size of (\d+) bytes", text)
+    page = int(m.group(1)) if m else PAGE
+    pages = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        if v.strip().rstrip(".").isdigit():
+            pages[k.strip()] = int(v.strip().rstrip("."))
+    return sum(pages.get(k, 0) for k in ("Pages free", "Pages inactive", "Pages speculative")) * page
+
+
+def parse_swapusage(text):
+    """sysctl vm.swapusage: 'total = 2048.00M  used = 1034.25M  free = 1013.75M  (encrypted)'."""
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    vals = {k: float(n) * units.get(u, 1) for k, n, u in re.findall(r"(\w+) = ([\d.]+)([KMG]?)", text)}
+    return int(vals.get("used", 0)), int(vals.get("total", 0))
+
+
+def machine_macos():
+    total = run("sysctl", "-n", "hw.memsize").strip()
+    swap_used, swap_total = parse_swapusage(run("sysctl", "-n", "vm.swapusage"))
+    return {
+        "mem_total": int(total) if total.isdigit() else 0,
+        "mem_avail": parse_vm_stat(run("vm_stat")),
+        "swap_used": swap_used,
+        "swap_total": swap_total,
+    }
+
+
+def machine():
+    return {"load": os.getloadavg(), **(machine_linux() if LINUX else machine_macos())}
 
 
 # ---------------------------------------------------------------- queue state
@@ -174,15 +280,27 @@ def read_file(path):
         return ""
 
 
-def slot_count():
-    n = DEFAULT_SLOTS
+def slot_limit():
+    """The live slot count, read as run-queued reads it: slots file, then AGENT_QUEUE_SLOTS, then 2."""
+    text = read_file(SLOTS_FILE).strip()
+    return int(text) if re.fullmatch(r"[1-9][0-9]*", text) else DEFAULT_SLOTS
+
+
+def set_slot_limit(n):
+    os.makedirs(QUEUE_DIR, exist_ok=True)
+    tmp = f"{SLOTS_FILE}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(f"{n}\n")
+    os.replace(tmp, SLOTS_FILE)  # a poller never sees a half-written file
+
+
+def highest_slot():
+    """Highest N with a slot-N.lock. Slots above the limit may still be finishing a run."""
+    n = 0
     try:
         for name in os.listdir(QUEUE_DIR):
-            if name.startswith("slot-") and name.endswith(".lock"):
-                try:
-                    n = max(n, int(name[5:-5]))
-                except ValueError:
-                    pass
+            if name.startswith("slot-") and name.endswith(".lock") and name[5:-5].isdigit():
+                n = max(n, int(name[5:-5]))
     except OSError:
         pass
     return n
@@ -191,8 +309,8 @@ def slot_count():
 @dataclass
 class Snapshot:
     at: float
-    nslots: int
-    slots: dict  # slot number -> Entry or None
+    nslots: int  # the limit
+    slots: dict  # slot number -> Entry or None; slots above the limit appear only while busy
     waiting: list
     machine: dict
     ok: bool = True
@@ -200,10 +318,11 @@ class Snapshot:
 
 @dataclass
 class Sampler:
-    prev_ticks: dict = field(default_factory=dict)
+    prev_cpu: dict = field(default_factory=dict)
     prev_at: float = 0.0
     running: dict = field(default_factory=dict)  # run-queued pid -> Entry, to detect finishes
-    history: deque = field(default_factory=lambda: deque(maxlen=50))
+    history: deque = field(default_factory=lambda: deque(maxlen=500))
+    finished: int = 0  # total ever added to history, so a view can tell how many are new
 
     def sample(self):
         now = time.time()
@@ -211,7 +330,7 @@ class Sampler:
         procs = read_procs()
         kids = children_map(procs)
         dt = now - self.prev_at if self.prev_at else 0.0
-        ticks_now = {}
+        cpu_now = {}
 
         def measure(e):
             pids = [p for p in tree(e.pid, kids) if p in procs]
@@ -219,23 +338,23 @@ class Sampler:
             e.rss = sum(procs[p].rss for p in pids)
             total = 0
             for p in pids:
-                ticks_now[p] = procs[p].ticks
-                if dt and p in self.prev_ticks:
-                    total += max(0, procs[p].ticks - self.prev_ticks[p])
-            e.cpu = 100.0 * total / CLK_TCK / dt if dt else 0.0
+                cpu_now[p] = procs[p].cpu
+                if dt and p in self.prev_cpu:
+                    total += max(0.0, procs[p].cpu - self.prev_cpu[p])
+            e.cpu = 100.0 * total / dt if dt else 0.0
             direct = [procs[c].start for c in kids.get(e.pid, ()) if c in procs]
             e.run_start = min(direct) if direct else now
 
-        nslots = slot_count()
+        nslots = slot_limit()
         slots = {}
-        for i in range(1, nslots + 1):
+        for i in range(1, max(nslots, highest_slot()) + 1):
             info = parse_info(read_file(os.path.join(QUEUE_DIR, f"slot-{i}.info")))
-            if info and info[0] in procs and is_run_queued(info[0]):
+            if info and info[0] in procs and is_run_queued(info[0], procs):
                 pid, label, cmd, _ = info
                 e = Entry(pid, label, cmd, procs[pid].start, slot=i, checkout=checkout_of(pid) or "")
                 measure(e)
                 slots[i] = e
-            else:
+            elif i <= nslots:
                 slots[i] = None
 
         waiting = []
@@ -247,7 +366,7 @@ class Sampler:
             if not (name.startswith("wait-") and name.endswith(".info")):
                 continue
             info = parse_info(read_file(os.path.join(QUEUE_DIR, name)))
-            if not info or info[0] not in procs or not is_run_queued(info[0]):
+            if not info or info[0] not in procs or not is_run_queued(info[0], procs):
                 continue
             pid, label, cmd, checkout = info
             if any(s and s.pid == pid for s in slots.values()):
@@ -264,8 +383,10 @@ class Sampler:
         for pid, e in self.running.items():
             if pid not in live:
                 self.history.appendleft((now, e))
+                self.finished += 1
         self.running = live
-        self.prev_ticks, self.prev_at = ticks_now, now
+        forget_checkouts(procs)
+        self.prev_cpu, self.prev_at = cpu_now, now
         return Snapshot(now, nslots, slots, waiting, machine(), ok)
 
 
@@ -293,8 +414,64 @@ def clock(epoch):
     return time.strftime("%H:%M:%S", time.localtime(epoch))
 
 
-def lines_for(snap, sampler):
-    """Build the screen as a list of rows; each row is a list of (text, style) spans.
+def advice(snap, busy):
+    """One line reading the machine numbers against the slot count: (text, style)."""
+    m = snap.machine
+    load1, waiting = m["load"][0], len(snap.waiting)
+    avail = m["mem_avail"] / m["mem_total"] if m["mem_total"] else 1
+    swap = m["swap_used"] / m["swap_total"] if m["swap_total"] else 0
+    why = []
+    if load1 > NCPU * 1.5:
+        why.append(f"load {load1:.0f} is well over {NCPU} cores")
+    if avail < 0.1:
+        why.append(f"only {size(m['mem_avail'])} memory free")
+    if swap > 0.8:
+        why.append("swap nearly full")
+    if why:
+        return (f"overloaded: {', '.join(why)}. Runs will be slow or killed; "
+                "lower slots (-) rather than raise them", "bad")
+    if load1 > NCPU:
+        why.append(f"load {load1:.0f} is over {NCPU} cores")
+    if avail < 0.25:
+        why.append(f"{size(m['mem_avail'])} memory free")
+    if swap > 0.4:
+        why.append("swap in heavy use")
+    if why:
+        return f"busy: {', '.join(why)}. More slots would slow every run", "warn"
+    if waiting and busy >= snap.nslots and load1 < NCPU * 0.6:
+        return (f"headroom: load {load1:.0f} of {NCPU} cores and memory is fine, "
+                f"with {waiting} waiting. Raising slots (+) would likely help", "free")
+    return f"ok: load {load1:.0f} of {NCPU} cores, memory fine", "dim"
+
+
+HELP = [
+    [(" queue-dash help", "title"), ("   any key closes", "dim")],
+    [],
+    [(" HEADER", "title")],
+    [("  slots busy    ", ""), ("running jobs / the slot limit. Each slot runs one heavy command.", "dim")],
+    [("  waiting       ", ""), ("runs queued for a slot, or for another run in their own checkout.", "dim")],
+    [("  load          ", ""), ("processes running or waiting for CPU (or disk), averaged over 1, 5", "dim")],
+    [("                ", ""), ("and 15 min. Under the core count the CPUs keep up; over it, every", "dim")],
+    [("                ", ""), ("run slows. Yellow: over the cores, red: over 1.5x. 1m > 15m: rising.", "dim")],
+    [("  mem avail     ", ""), ("memory that can be handed out without swapping. Yellow under 25%.", "dim")],
+    [("  swap          ", ""), ("memory pushed to disk. Heavy swapping makes everything crawl.", "dim")],
+    [("  second line   ", ""), ("reads those numbers for you and says whether to change the slots.", "dim")],
+    [(" SLOTS", "title")],
+    [("  ran / queued  ", ""), ("how long the command has run, and how long it waited first.", "dim")],
+    [("  cpu           ", ""), ("% of one core, summed over the job's processes (800% = 8 cores).", "dim")],
+    [("  rss / procs   ", ""), ("memory in use and process count, over the whole process tree.", "dim")],
+    [(" KEYS", "title")],
+    [("  + / -         ", ""), ("raise or lower the slot limit, machine-wide. Running jobs never stop;", "dim")],
+    [("                ", ""), ("waiters see a new limit within a few seconds.", "dim")],
+    [("  [ / ]         ", ""), ("refresh the dashboard more or less often (display only).", "dim")],
+    [("  r             ", ""), ("refresh now.", "dim")],
+    [("  Tab           ", ""), ("browse finished runs: arrows, PgUp/PgDn, Home/End, Enter for details.", "dim")],
+    [("  q             ", ""), ("quit.", "dim")],
+]
+
+
+def top_rows(snap):
+    """Header, slots and waiting, as a list of rows; each row is a list of (text, style) spans.
     Styles: 'title', 'dim', 'busy', 'free', 'warn', 'bad', 'wait', 'check', ''."""
     rows = []
     m = snap.machine
@@ -311,25 +488,35 @@ def lines_for(snap, sampler):
 
     rows.append([
         (" run-queued ", "title"),
-        (f"  {busy}/{snap.nslots} slots busy", "busy" if busy == snap.nslots else "free"),
+        (f"  {busy}/{snap.nslots} slots busy", "busy" if busy >= snap.nslots else "free"),
         (f"  {len(snap.waiting)} waiting", "wait" if snap.waiting else "dim"),
         ("   load ", "dim"),
         (" ".join(f"{x:.1f}" for x in m["load"]), load_style),
-        (f" /{NCPU}", "dim"),
+        (f" (1/5/15m) on {NCPU} cores", "dim"),
         ("  mem avail ", "dim"),
         (f"{size(m['mem_avail'])}/{size(m['mem_total'])}", mem_style),
         *swap,
         (f"   {clock(snap.at)}", "dim"),
     ])
+    text, style = advice(snap, busy)
+    rows.append([(" ", ""), (text, style)])
     if not snap.ok:
         rows.append([(f" queue dir {QUEUE_DIR} does not exist yet (nothing has queued)", "warn")])
     rows.append([])
 
-    rows.append([(" SLOTS", "title")])
-    for i in range(1, snap.nslots + 1):
+    rows.append([(f" SLOTS ({snap.nslots})", "title")])
+    order = sorted(snap.slots)
+    for n, i in enumerate(order):
         e = snap.slots[i]
         if not e:
-            rows.append([(f"  {i} ", ""), ("○ free", "free")])
+            if n and not snap.slots[order[n - 1]]:
+                continue  # part of a run of free slots, drawn by its first one
+            last = i
+            for j in order[n + 1 :]:
+                if snap.slots[j]:
+                    break
+                last = j
+            rows.append([(f"  {i} " if last == i else f"  {i}–{last} ", ""), ("○ free", "free")])
             continue
         queued_for = e.run_start - e.submitted
         rows.append([
@@ -343,6 +530,7 @@ def lines_for(snap, sampler):
             ("  rss ", "dim"), (f"{size(e.rss):>6}", ""),
             ("  procs ", "dim"), (f"{e.nprocs}", ""),
             (f"  pid {e.pid}", "dim"),
+            *([("  above limit, finishing", "warn")] if i > snap.nslots else []),
         ])
         rows.append([("      ", ""), (e.command, "dim")])
     rows.append([])
@@ -364,19 +552,28 @@ def lines_for(snap, sampler):
         ])
         rows.append([("      ", ""), (e.command, "dim")])
     rows.append([])
-
-    rows.append([(" FINISHED ", "title"), ("since this dashboard opened", "dim")])
-    if not sampler.history:
-        rows.append([("  none yet", "dim")])
-    for ended, e in sampler.history:
-        rows.append([
-            (f"  {clock(ended)} ", "dim"),
-            (f"{e.label:<24.24} ", ""),
-            ("ran ", "dim"), (f"{dur(ended - e.run_start):>7}", ""),
-            ("  queued ", "dim"), (f"{dur(e.run_start - e.submitted):>6}  ", "dim"),
-            (e.command, "dim"),
-        ])
     return rows
+
+
+def finished_row(ended, e):
+    return [
+        (f"  {clock(ended)} ", "dim"),
+        (f"{e.label:<24.24} ", ""),
+        ("ran ", "dim"), (f"{dur(ended - e.run_start):>7}", ""),
+        ("  queued ", "dim"), (f"{dur(e.run_start - e.submitted):>6}  ", "dim"),
+        (e.command, "dim"),
+    ]
+
+
+def finished_detail(ended, e):
+    return [
+        [("      command  ", "dim"), (e.command, "")],
+        [("      checkout ", "dim"), (e.checkout or "?", "")],
+        [("      slot ", "dim"), (f"{e.slot}", ""), ("  pid ", "dim"), (f"{e.pid}", ""),
+         ("  queued ", "dim"), (clock(e.submitted), ""), ("  started ", "dim"),
+         (clock(e.run_start), ""), ("  ended ", "dim"), (clock(ended), ""),
+         ("  exit code not recorded by run-queued", "dim")],
+    ]
 
 
 # ---------------------------------------------------------------- output
@@ -387,8 +584,50 @@ def print_once():
     s.sample()
     time.sleep(0.5)  # a second sample so cpu% has an interval to measure
     snap = s.sample()
-    for row in lines_for(snap, s):
+    rows = top_rows(snap) + [[(" FINISHED ", "title"), ("since this dashboard opened", "dim")]]
+    rows += [finished_row(ended, e) for ended, e in s.history] or [[("  none yet", "dim")]]
+    for row in rows:
         print("".join(text for text, _ in row))
+
+
+@dataclass
+class FinishedView:
+    """Cursor and scroll state for the finished list. Rows are items (one run each), and an
+    expanded item takes extra lines, so the cursor counts items and the scroll counts lines."""
+    focus: bool = False
+    cursor: int = 0
+    top: int = 0
+    expanded: set = field(default_factory=set)  # (pid, ended) of runs showing details
+    seen: int = 0  # sampler.finished when last drawn
+
+    def lines(self, history):
+        out = []  # (item index, row)
+        for n, (ended, e) in enumerate(history):
+            out.append((n, finished_row(ended, e)))
+            if (e.pid, ended) in self.expanded:
+                out += [(n, r) for r in finished_detail(ended, e)]
+        return out
+
+    def follow_new(self, sampler):
+        """New runs are prepended; keep the cursor on the run it was on while browsing."""
+        new, self.seen = sampler.finished - self.seen, sampler.finished
+        if self.focus and new:
+            self.cursor += new
+            self.top += new
+
+    def scroll_into_view(self, lines, height):
+        n_items = lines[-1][0] + 1 if lines else 0
+        self.cursor = max(0, min(self.cursor, n_items - 1))
+        if not self.focus:
+            self.top = 0
+            return
+        mine = [y for y, (n, _) in enumerate(lines) if n == self.cursor]
+        if mine:
+            if mine[0] < self.top:
+                self.top = mine[0]
+            if mine[-1] >= self.top + height:
+                self.top = max(mine[0], mine[-1] - height + 1) if len(mine) <= height else mine[0]
+        self.top = max(0, min(self.top, len(lines) - height))
 
 
 def run_curses(stdscr, interval):
@@ -402,43 +641,141 @@ def run_curses(stdscr, interval):
         curses.init_pair(n, color, -1)
         styles[name] = curses.color_pair(n) | (curses.A_BOLD if name in ("title", "bad") else 0)
 
+    def draw(y, row, w, extra=0):
+        x = 0
+        if extra:  # fill the line so a highlighted row reads as one bar
+            try:
+                stdscr.addstr(y, 0, " " * (w - 1), extra)
+            except curses.error:
+                pass
+        for text, style in row:
+            if x >= w - 1:
+                break
+            text = text[: w - 1 - x]
+            try:
+                stdscr.addstr(y, x, text, styles.get(style, 0) | extra)
+            except curses.error:
+                pass
+            x += len(text)
+
     sampler = Sampler()
     snap = sampler.sample()
+    view = FinishedView()
+    view.seen = sampler.finished
+    flash, flash_until = "", 0.0
     next_at = time.time() + interval
+    page = 10
+    show_help = False
     while True:
         h, w = stdscr.getmaxyx()
         stdscr.erase()
-        rows = lines_for(snap, sampler)
-        for y, row in enumerate(rows[: h - 1]):
-            x = 0
-            for text, style in row:
-                if x >= w - 1:
-                    break
-                text = text[: w - 1 - x]
-                try:
-                    stdscr.addstr(y, x, text, styles.get(style, 0))
-                except curses.error:
-                    pass
-                x += len(text)
-        footer = f" q quit · r refresh · +/- interval ({interval:g}s) · {QUEUE_DIR} "
-        if len(rows) > h - 1:
-            footer += f"· {len(rows) - h + 1} rows hidden, enlarge the terminal "
+        if show_help:
+            for y, row in enumerate(HELP[: h - 1]):
+                draw(y, row, w)
+            stdscr.refresh()
+            stdscr.timeout(max(50, int((next_at - time.time()) * 1000)))
+            if stdscr.getch() != -1:
+                show_help = False
+            elif time.time() >= next_at:  # keep sampling so finished runs are not missed
+                snap = sampler.sample()
+                view.follow_new(sampler)
+                next_at = time.time() + interval
+            continue
+        top = top_rows(snap)
+        lines = view.lines(sampler.history)
+        # The finished list takes whatever the rows above leave, but never under 3 lines.
+        list_h = max(3, h - 2 - len(top))
+        top = top[: max(0, h - 2 - list_h)]
+        page = max(1, list_h - 1)
+        view.scroll_into_view(lines, list_h)
+        for y, row in enumerate(top):
+            draw(y, row, w)
+
+        y = len(top)
+        n_items = len(sampler.history)
+        title = [(f" FINISHED ({n_items}) ", "title"), ("since this dashboard opened", "dim")]
+        if len(lines) > list_h:
+            shown = sorted({n for n, _ in lines[view.top : view.top + list_h]})
+            title.append((f"   showing {shown[0] + 1}–{shown[-1] + 1}", "dim"))
+        if not view.focus and n_items:
+            title.append(("   Tab to browse", "dim"))
+        draw(y, title, w)
+        if not lines:
+            draw(y + 1, [("  none yet", "dim")], w)
+        for i, (n, row) in enumerate(lines[view.top : view.top + list_h]):
+            hl = curses.A_REVERSE if view.focus and n == view.cursor else 0
+            draw(y + 1 + i, row, w, hl)
+
+        if time.time() < flash_until:
+            footer = f" {flash} "
+        elif view.focus:
+            footer = " ↑↓ move · PgUp/PgDn · Home/End · Enter details · Esc/Tab back · q quit "
+        else:
+            footer = (f" ? help · q quit · r refresh now · + - slots: {snap.nslots} · [ ] refresh every {interval:g}s"
+                      f" · Tab finished · {QUEUE_DIR} ")
         try:
             stdscr.addstr(h - 1, 0, footer[: w - 1], curses.A_REVERSE)
         except curses.error:
             pass
         stdscr.refresh()
 
-        stdscr.timeout(max(50, int((next_at - time.time()) * 1000)))
+        wake = min(next_at, flash_until) if time.time() < flash_until else next_at
+        stdscr.timeout(max(50, int((wake - time.time()) * 1000)))
         key = stdscr.getch()
-        if key in (ord("q"), ord("Q"), 27):
+        refresh = False
+        if key in (ord("q"), ord("Q")):
             return
-        if key in (ord("+"), ord("=")):
+        if key in (ord("?"), ord("h")):
+            show_help = True
+            continue
+        if key == 27:  # Esc leaves the list first, then quits
+            if not view.focus:
+                return
+            view.focus = False
+        elif key == 9:  # Tab
+            view.focus = not view.focus and bool(sampler.history)
+        elif key in (ord("+"), ord("=")) or key in (ord("-"), ord("_")):
+            old = slot_limit()
+            new = max(1, min(MAX_SLOTS, old + (1 if key in (ord("+"), ord("=")) else -1)))
+            if new != old:
+                try:
+                    set_slot_limit(new)
+                    flash = f"slots {old} → {new} (machine-wide; running jobs are never stopped)"
+                except OSError as err:
+                    flash = f"could not write {SLOTS_FILE}: {err.strerror}"
+            else:
+                flash = f"slots already at {'minimum' if new == 1 else 'maximum'} ({new})"
+            flash_until = time.time() + 2.5
+            refresh = True
+        elif key == ord("]"):
             interval = min(30.0, interval * 2)
-        elif key in (ord("-"), ord("_")):
+            flash, flash_until = f"refresh every {interval:g}s", time.time() + 1.5
+        elif key == ord("["):
             interval = max(0.25, interval / 2)
-        if key == ord("r") or time.time() >= next_at:
+            flash, flash_until = f"refresh every {interval:g}s", time.time() + 1.5
+        elif key in (ord("r"), ord("R")):
+            flash, flash_until = f"refreshed at {clock(time.time())}", time.time() + 1.0
+            refresh = True
+        elif view.focus:
+            if key in (curses.KEY_UP, ord("k")):
+                view.cursor -= 1
+            elif key in (curses.KEY_DOWN, ord("j")):
+                view.cursor += 1
+            elif key == curses.KEY_PPAGE:
+                view.cursor -= page
+            elif key in (curses.KEY_NPAGE, ord(" ")):
+                view.cursor += page
+            elif key in (curses.KEY_HOME, ord("g")):
+                view.cursor = 0
+            elif key in (curses.KEY_END, ord("G")):
+                view.cursor = len(sampler.history) - 1
+            elif key in (10, 13, curses.KEY_ENTER) and sampler.history:
+                view.cursor = max(0, min(view.cursor, len(sampler.history) - 1))
+                ended, e = sampler.history[view.cursor]
+                view.expanded ^= {(e.pid, ended)}
+        if refresh or time.time() >= next_at:
             snap = sampler.sample()
+            view.follow_new(sampler)
             next_at = time.time() + interval
 
 

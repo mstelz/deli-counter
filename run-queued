@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Run a heavy command (tests, typecheck, builds, bundling, model evals) only when a slot is free.
+#
+# Why: parallel AI agents (Claude, Codex, Gemini) across several projects overload this VM. Under
+# load, tests time out, the task killer ends runs half-way, and the work is lost. A queue turns
+# "everyone runs at once and half die" into "a few run at a time and all finish".
+#
+# Two locks, taken in this order:
+#   1. per checkout (git toplevel, else cwd): agents in one checkout often share state (a test
+#      database, build output), so two heavy runs there must never overlap;
+#   2. one of N machine-wide slots under /tmp/agent-queue.
+# Locks are flock(1) locks: the kernel releases them when the process exits, killed or not, so a
+# dead run never leaves a stale lock behind.
+#
+# N is live: the queue's `slots` file (written by `run-queued --slots N` or queue-dash) wins, then
+# AGENT_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
+# Lowering it never stops a running command; it only keeps new runs out of the slots above N.
+#
+# Runs on Linux and macOS (bash 3.2 or later). macOS needs flock: `brew install flock`.
+#
+# Usage:
+#   run-queued [--label <text>] -- <command> [args...]
+#   run-queued --status
+#   run-queued --slots [N]       print, or set, the machine-wide slot count
+set -euo pipefail
+
+QUEUE_DIR="${AGENT_QUEUE_DIR:-/tmp/agent-queue}"
+SLOTS_FILE="$QUEUE_DIR/slots"
+POLL_SECONDS="${AGENT_QUEUE_POLL_SECONDS:-5}"
+mkdir -p "$QUEUE_DIR"
+command -v flock >/dev/null || {
+  echo "run-queued: flock not found (macOS: brew install flock; Linux: it is in util-linux)" >&2
+  exit 127
+}
+
+slot_count() {
+  local n
+  n="$(cat "$SLOTS_FILE" 2>/dev/null || true)"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n="${AGENT_QUEUE_SLOTS:-2}"
+  echo "$n"
+}
+
+status() {
+  local f i busy n
+  SLOTS="$(slot_count)"
+  echo "slots ($SLOTS):"
+  # Slots above N that are still running (N was lowered) show until their command ends.
+  n="$SLOTS"
+  for f in "$QUEUE_DIR"/slot-*.lock; do
+    [ -e "$f" ] || continue
+    i="$(basename "$f" .lock)"; i="${i#slot-}"
+    [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -gt "$n" ] && n="$i"
+  done
+  for i in $(seq 1 "$n"); do
+    f="$QUEUE_DIR/slot-$i.info"
+    busy=1
+    flock -n "$QUEUE_DIR/slot-$i.lock" true 2>/dev/null && busy=0
+    if [ "$i" -le "$SLOTS" ]; then
+      if [ "$busy" = 0 ]; then echo "  slot $i: free"
+      else echo "  slot $i: $(cat "$f" 2>/dev/null || echo busy)"; fi
+    elif [ "$busy" = 1 ]; then
+      echo "  slot $i: $(cat "$f" 2>/dev/null || echo busy) (above limit, finishing)"
+    fi
+  done
+  echo "waiting:"
+  for f in "$QUEUE_DIR"/wait-*.info; do
+    [ -e "$f" ] || continue
+    # A waiter that was killed leaves its file behind; show only live ones.
+    kill -0 "$(basename "$f" .info | sed 's/^wait-//')" 2>/dev/null && echo "  $(cat "$f")"
+  done
+}
+
+if [ "${1:-}" = "--status" ]; then status; exit 0; fi
+if [ "${1:-}" = "--slots" ]; then
+  if [ $# -lt 2 ]; then slot_count; exit 0; fi
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "run-queued: --slots needs a positive integer" >&2; exit 2; }
+  # Write then rename, so a poller never reads a half-written file.
+  printf '%s\n' "$2" >"$SLOTS_FILE.$$" && mv -f "$SLOTS_FILE.$$" "$SLOTS_FILE"
+  echo "slots: $2"
+  exit 0
+fi
+
+LABEL=""
+if [ "${1:-}" = "--label" ]; then LABEL="$2"; shift 2; fi
+if [ "${1:-}" != "--" ]; then
+  echo "usage: $0 [--label <text>] -- <command> [args...]   |   $0 --status" >&2
+  exit 2
+fi
+shift
+[ $# -gt 0 ] || { echo "run-queued: no command given" >&2; exit 2; }
+
+WORKTREE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# sha1sum on Linux, shasum on macOS: the same SHA-1, so a checkout's lock name matches on both.
+if command -v sha1sum >/dev/null; then HASH=sha1sum; else HASH=shasum; fi
+WT_KEY="$(printf '%s' "$WORKTREE" | "$HASH" | cut -c1-12)"
+DESC="pid $$ · ${LABEL:-$(basename "$WORKTREE")} · $(date +%H:%M:%S) · $*"
+WAIT_FILE="$QUEUE_DIR/wait-$$.info"
+trap 'rm -f "$WAIT_FILE"' EXIT
+
+# 1. The checkout lock (blocking). fd 8 is held until this script exits.
+exec 8>"$QUEUE_DIR/worktree-$WT_KEY.lock"
+if ! flock -n 8; then
+  echo "run-queued: waiting for another run in this checkout ($WORKTREE)" >&2
+  echo "$DESC (checkout)" >"$WAIT_FILE"
+  flock 8
+fi
+
+# 2. A machine-wide slot. Poll every slot without blocking, so we take whichever frees first.
+announced=0
+while :; do
+  SLOTS="$(slot_count)"
+  for i in $(seq 1 "$SLOTS"); do
+    exec 9>"$QUEUE_DIR/slot-$i.lock"
+    if flock -n 9; then
+      rm -f "$WAIT_FILE"
+      echo "$DESC" >"$QUEUE_DIR/slot-$i.info"
+      [ "$announced" = 1 ] && echo "run-queued: got slot $i" >&2
+      # Run as a child, not exec: fds 8 and 9 stay held by this shell until the command ends.
+      set +e
+      "$@" 8>&- 9>&-   # the child must not inherit the locks, or a daemon it leaves behind would hold them
+      rc=$?
+      set -e
+      : >"$QUEUE_DIR/slot-$i.info"
+      exit "$rc"
+    fi
+    exec 9>&-
+  done
+  if [ "$announced" = 0 ]; then
+    echo "run-queued: all $SLOTS slots busy; queued (see: $0 --status)" >&2
+    echo "$DESC" >"$WAIT_FILE"
+    announced=1
+  fi
+  sleep "$POLL_SECONDS"
+done
