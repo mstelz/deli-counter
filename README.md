@@ -26,8 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/mstelz/deli-counter/main/install.sh
 ```
 
 This clones the repo to `~/.local/share/deli-counter` and symlinks `deli` and `deli-counter`
-into `~/.local/bin`. (It also adds `run-queued` and `queue-dash` aliases for backward compatibility).
-It asks before installing anything else (flock on macOS, and the Claude Code skill if you use Claude Code).
+into `~/.local/bin`. It asks before installing anything else (flock on macOS, and the Claude
+Code skill if you use Claude Code).
 Add `-s -- -y` after `bash` to say yes to everything. Run the same command again to update.
 
 Or from a clone:
@@ -67,9 +67,9 @@ A few details:
 - Changing the slot count takes effect within a few seconds. Lowering it doesn't stop anything
   already running; those runs just finish.
 
-Environment variables, if you need them: `DELI_QUEUE_DIR` / `AGENT_QUEUE_DIR` (where the queue keeps its files,
-default `/tmp/agent-queue`), `DELI_QUEUE_SLOTS` / `AGENT_QUEUE_SLOTS` (starting slot count if you never set one),
-`DELI_QUEUE_POLL_SECONDS` / `AGENT_QUEUE_POLL_SECONDS` (how often waiting runs check for a slot, default 5).
+Environment variables, if you need them: `DELI_QUEUE_DIR` (where the queue keeps its files,
+default `/tmp/deli-queue`), `DELI_QUEUE_SLOTS` (starting slot count if you never set one),
+`DELI_QUEUE_POLL_SECONDS` (how often waiting runs check for a slot, default 5).
 
 ## Getting agents to use it
 
@@ -112,7 +112,7 @@ shorter than a second or so.
 
 ## How it works
 
-Everything is plain files in `/tmp/agent-queue`. Each slot is a lock file (`slot-1.lock`, ...)
+Everything is plain files in `/tmp/deli-queue`. Each slot is a lock file (`slot-1.lock`, ...)
 that a run holds with `flock` while its command runs, plus an info file saying who has it.
 Waiting runs write a `wait-<pid>.info` file and check for a free slot every few seconds. The
 slot count is in a file called `slots`. The dashboard reads those files plus process info

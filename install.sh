@@ -11,11 +11,10 @@
 # updates them. The Claude Code skill is linked into ~/.claude/skills if you want it.
 set -euo pipefail
 
-REPO="${DELI_COUNTER_REPO:-${RUN_QUEUED_REPO:-${QUEUE_DASH_REPO:-https://github.com/mstelz/deli-counter.git}}}"
-CLONE_DIR="${DELI_COUNTER_DIR:-${RUN_QUEUED_DIR:-${QUEUE_DASH_DIR:-$HOME/.local/share/deli-counter}}}"
+REPO="${DELI_COUNTER_REPO:-https://github.com/mstelz/deli-counter.git}"
+CLONE_DIR="${DELI_COUNTER_DIR:-$HOME/.local/share/deli-counter}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILL="$HOME/.claude/skills/deli/SKILL.md"
-LEGACY_SKILL="$HOME/.claude/skills/run-queued/SKILL.md"
 
 say() { printf '%s\n' "$*"; }
 tilde() { local t='~'; printf '%s' "${1/#$HOME/$t}"; }  # bash 3.2 keeps a \~ literally
@@ -69,7 +68,8 @@ if [ "$UNINSTALL" = 1 ]; then
   unlink_if_ours "$BIN_DIR/run-queued"
   unlink_if_ours "$BIN_DIR/queue-dash"
   unlink_if_ours "$SKILL"
-  unlink_if_ours "$LEGACY_SKILL"
+  unlink_if_ours "$HOME/.claude/skills/run-queued/SKILL.md"
+  rmdir "$HOME/.claude/skills/run-queued" 2>/dev/null || true
   say "Done. If the installer cloned it, the code is still in $(tilde "$CLONE_DIR")."
   exit 0
 fi
@@ -130,14 +130,16 @@ say "Linking:"
 link "$SRC/deli" "$BIN_DIR/deli"
 link "$SRC/deli-counter" "$BIN_DIR/deli-counter"
 link "$SRC/deli-counter" "$BIN_DIR/deli-dash"
-# Backward compatibility symlinks so existing scripts/agents do not break:
-link "$SRC/deli" "$BIN_DIR/run-queued"
-link "$SRC/deli-counter" "$BIN_DIR/queue-dash"
+
+# Clean up any legacy links:
+unlink_if_ours "$BIN_DIR/run-queued"
+unlink_if_ours "$BIN_DIR/queue-dash"
+unlink_if_ours "$HOME/.claude/skills/run-queued/SKILL.md"
+rmdir "$HOME/.claude/skills/run-queued" 2>/dev/null || true
 
 if [ -d "$HOME/.claude" ]; then
   if [ -L "$SKILL" ] || ask "Add the Claude Code skill that tells Claude to use the deli queue?" y; then
     link "$SRC/skills/deli/SKILL.md" "$SKILL"
-    [ -L "$LEGACY_SKILL" ] && link "$SRC/skills/deli/SKILL.md" "$LEGACY_SKILL"
   fi
 fi
 

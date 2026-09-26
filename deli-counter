@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live terminal dashboard for the deli-counter work queue.
 
-deli keeps its state as plain files in $DELI_QUEUE_DIR / $AGENT_QUEUE_DIR (default /tmp/agent-queue):
+deli keeps its state as plain files in $DELI_QUEUE_DIR (default /tmp/deli-queue):
   slot-N.info    "pid P · label · HH:MM:SS · command" while slot N is running, empty when free
   wait-P.info    the same line for a queued run, suffixed " (checkout)" when it waits on its
                  own checkout's lock rather than on a machine-wide slot
@@ -29,9 +29,9 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-QUEUE_DIR = os.environ.get("DELI_QUEUE_DIR", os.environ.get("AGENT_QUEUE_DIR", "/tmp/agent-queue"))
+QUEUE_DIR = os.environ.get("DELI_QUEUE_DIR", "/tmp/deli-queue")
 SLOTS_FILE = os.path.join(QUEUE_DIR, "slots")
-DEFAULT_SLOTS = int(os.environ.get("DELI_QUEUE_SLOTS", os.environ.get("AGENT_QUEUE_SLOTS", "2")))
+DEFAULT_SLOTS = int(os.environ.get("DELI_QUEUE_SLOTS", "2"))
 MAX_SLOTS = 64
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -140,14 +140,12 @@ def tree(pid, kids):
     return out
 
 
-def is_run_queued(pid, procs):
+def is_deli(pid, procs):
     if not LINUX:
-        args = procs[pid].args
-        return "deli" in args or "run-queued" in args
+        return "deli" in procs[pid].args
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmd = f.read()
-            return b"deli" in cmd or b"run-queued" in cmd
+            return b"deli" in f.read()
     except OSError:
         return False
 
@@ -351,7 +349,7 @@ class Sampler:
         slots = {}
         for i in range(1, max(nslots, highest_slot()) + 1):
             info = parse_info(read_file(os.path.join(QUEUE_DIR, f"slot-{i}.info")))
-            if info and info[0] in procs and is_run_queued(info[0], procs):
+            if info and info[0] in procs and is_deli(info[0], procs):
                 pid, label, cmd, _ = info
                 e = Entry(pid, label, cmd, procs[pid].start, slot=i, checkout=checkout_of(pid) or "")
                 measure(e)
@@ -368,7 +366,7 @@ class Sampler:
             if not (name.startswith("wait-") and name.endswith(".info")):
                 continue
             info = parse_info(read_file(os.path.join(QUEUE_DIR, name)))
-            if not info or info[0] not in procs or not is_run_queued(info[0], procs):
+            if not info or info[0] not in procs or not is_deli(info[0], procs):
                 continue
             pid, label, cmd, checkout = info
             if any(s and s.pid == pid for s in slots.values()):

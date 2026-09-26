@@ -8,12 +8,12 @@
 # Two locks, taken in this order:
 #   1. per checkout (git toplevel, else cwd): agents in one checkout often share state (a test
 #      database, build output), so two heavy runs there must never overlap;
-#   2. one of N machine-wide slots under /tmp/agent-queue.
+#   2. one of N machine-wide slots under /tmp/deli-queue.
 # Locks are flock(1) locks: the kernel releases them when the process exits, killed or not, so a
 # dead run never leaves a stale lock behind.
 #
 # N is live: the queue's `slots` file (written by `deli --slots N` or deli-counter) wins, then
-# DELI_QUEUE_SLOTS / AGENT_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
+# DELI_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
 # Lowering it never stops a running command; it only keeps new runs out of the slots above N.
 #
 # Runs on Linux and macOS (bash 3.2 or later). macOS needs flock: `brew install flock`.
@@ -25,9 +25,9 @@
 #   deli                   (interactive) opens the deli-counter dashboard
 set -euo pipefail
 
-QUEUE_DIR="${DELI_QUEUE_DIR:-${AGENT_QUEUE_DIR:-/tmp/agent-queue}}"
+QUEUE_DIR="${DELI_QUEUE_DIR:-/tmp/deli-queue}"
 SLOTS_FILE="$QUEUE_DIR/slots"
-POLL_SECONDS="${DELI_QUEUE_POLL_SECONDS:-${AGENT_QUEUE_POLL_SECONDS:-5}}"
+POLL_SECONDS="${DELI_QUEUE_POLL_SECONDS:-5}"
 mkdir -p "$QUEUE_DIR"
 command -v flock >/dev/null || {
   echo "deli: flock not found (macOS: brew install flock; Linux: it is in util-linux)" >&2
@@ -37,7 +37,7 @@ command -v flock >/dev/null || {
 slot_count() {
   local n
   n="$(cat "$SLOTS_FILE" 2>/dev/null || true)"
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n="${DELI_QUEUE_SLOTS:-${AGENT_QUEUE_SLOTS:-2}}"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n="${DELI_QUEUE_SLOTS:-2}"
   echo "$n"
 }
 
