@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a heavy command (tests, typecheck, builds, bundling, model evals) only when a slot is free.
 #
-# Why: parallel AI agents (Claude, Codex, Gemini) across several projects overload this VM. Under
+# Why: parallel AI agents (Claude, Codex, Gemini) across several projects overload the machine. Under
 # load, tests time out, the task killer ends runs half-way, and the work is lost. A queue turns
 # "everyone runs at once and half die" into "a few run at a time and all finish".
 #

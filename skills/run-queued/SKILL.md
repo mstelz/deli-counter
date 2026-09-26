@@ -1,12 +1,12 @@
 ---
 name: run-queued
-description: Run CPU- or memory-heavy commands (test suites, typecheck, lint, builds, bundling, docker builds, model evals, headless browsers) through the machine-wide `run-queued` work queue so parallel agents on this VM do not overload it and get killed half-way. Use before any such command, when briefing sub-agents that will run one, or when a run died or timed out with no failed assertion.
+description: Run CPU- or memory-heavy commands (test suites, typecheck, lint, builds, bundling, docker builds, model evals, headless browsers) through the machine-wide `run-queued` work queue so parallel agents on the machine do not overload it and get killed half-way. Use before any such command, when briefing sub-agents that will run one, or when a run died or timed out with no failed assertion.
 ---
 
-# run-queued — the VM's shared work queue
+# run-queued — the machine-wide shared work queue
 
-This VM runs many AI agents (Claude, Codex, Gemini) across several projects at once. When heavy
-commands overlap, the VM is throttled, tests time out, and a task killer ends runs half-way. The
+This machine runs many AI agents (Claude, Codex, Gemini) across several projects at once. When heavy
+commands overlap, the machine is throttled, tests time out, and a task killer ends runs half-way. The
 work is lost and the agent sits waiting on a result that never comes.
 
 `run-queued` (on PATH, `~/.local/bin/run-queued`) makes heavy commands wait their turn:
