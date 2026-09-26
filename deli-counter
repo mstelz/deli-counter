@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -526,7 +527,7 @@ def advice(snap, busy):
 
 
 HELP = [
-    [(" deli-counter help", "title"), ("   any key closes", "dim")],
+    [(" 🥪 deli-counter help", "title"), ("   any key closes", "dim")],
     [],
     [(" HEADER", "title")],
     [("  slots busy    ", ""), ("running jobs / the slot limit. Each slot runs one heavy command.", "dim")],
@@ -568,7 +569,7 @@ def top_rows(snap):
                                     "bad" if sw_frac > 0.8 else "warn" if sw_frac > 0.4 else "")]
 
     rows.append([
-        (" deli-counter ", "title"),
+        (" 🥪 deli-counter ", "title"),
         (f"  {busy}/{snap.nslots} slots busy", "busy" if busy >= snap.nslots else "free"),
         (f"  {len(snap.waiting)} waiting", "wait" if snap.waiting else "dim"),
         ("   load ", "dim"),
@@ -739,6 +740,9 @@ def run_curses(stdscr, interval, demo=False):
         for name in pairs:
             styles[name] = curses.A_BOLD if name in ("title", "bad") else curses.A_NORMAL
 
+    def str_width(s):
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
     def draw(y, row, w, extra=0):
         x = 0
         if extra:  # fill the line so a highlighted row reads as one bar
@@ -754,7 +758,7 @@ def run_curses(stdscr, interval, demo=False):
                 stdscr.addstr(y, x, text, styles.get(style, 0) | extra)
             except curses.error:
                 pass
-            x += len(text)
+            x += str_width(text)
 
     sampler = DemoSampler() if demo else Sampler()
     snap = sampler.sample()
