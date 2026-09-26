@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Install run-queued and queue-dash on Linux or macOS.
+# Install deli and deli-counter on Linux or macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/mstelz/run-queued/main/install.sh | bash
-#       clones to ~/.local/share/run-queued (or updates it), then links the tools
+#   curl -fsSL https://raw.githubusercontent.com/mstelz/deli-counter/main/install.sh | bash
+#       clones to ~/.local/share/deli-counter (or updates it), then links the tools
 #   ./install.sh               from a clone: links the tools from this folder
 #   ./install.sh --uninstall   removes the links
 #   -y, --yes                  answer yes to every question (with curl: ... | bash -s -- -y)
@@ -11,10 +11,11 @@
 # updates them. The Claude Code skill is linked into ~/.claude/skills if you want it.
 set -euo pipefail
 
-REPO="${RUN_QUEUED_REPO:-${QUEUE_DASH_REPO:-https://github.com/mstelz/run-queued.git}}"
-CLONE_DIR="${RUN_QUEUED_DIR:-${QUEUE_DASH_DIR:-$HOME/.local/share/run-queued}}"
+REPO="${DELI_COUNTER_REPO:-${RUN_QUEUED_REPO:-${QUEUE_DASH_REPO:-https://github.com/mstelz/deli-counter.git}}}"
+CLONE_DIR="${DELI_COUNTER_DIR:-${RUN_QUEUED_DIR:-${QUEUE_DASH_DIR:-$HOME/.local/share/deli-counter}}}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-SKILL="$HOME/.claude/skills/run-queued/SKILL.md"
+SKILL="$HOME/.claude/skills/deli/SKILL.md"
+LEGACY_SKILL="$HOME/.claude/skills/run-queued/SKILL.md"
 
 say() { printf '%s\n' "$*"; }
 tilde() { local t='~'; printf '%s' "${1/#$HOME/$t}"; }  # bash 3.2 keeps a \~ literally
@@ -43,7 +44,7 @@ ask() {
   case "${answer:-$2}" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
-# Replace dest with a symlink in one rename, so an agent calling run-queued mid-install never
+# Replace dest with a symlink in one rename, so an agent calling deli mid-install never
 # finds it missing. A real file already there is copied to .bak first.
 link() {
   local target="$1" dest="$2"
@@ -62,9 +63,13 @@ unlink_if_ours() {
 }
 
 if [ "$UNINSTALL" = 1 ]; then
+  unlink_if_ours "$BIN_DIR/deli"
+  unlink_if_ours "$BIN_DIR/deli-counter"
+  unlink_if_ours "$BIN_DIR/deli-dash"
   unlink_if_ours "$BIN_DIR/run-queued"
   unlink_if_ours "$BIN_DIR/queue-dash"
   unlink_if_ours "$SKILL"
+  unlink_if_ours "$LEGACY_SKILL"
   say "Done. If the installer cloned it, the code is still in $(tilde "$CLONE_DIR")."
   exit 0
 fi
@@ -81,14 +86,14 @@ case "$OS" in
     if ! command -v flock >/dev/null; then
       if command -v brew >/dev/null; then
         # Installing software needs a yes: with no terminal to ask, skip it unless -y was given.
-        if ask "run-queued needs flock, which macOS doesn't include. Install it with Homebrew?" y n
+        if ask "deli needs flock, which macOS doesn't include. Install it with Homebrew?" y n
         then
           brew install flock
         else
-          say "note: run-queued won't work until you run: brew install flock"
+          say "note: deli won't work until you run: brew install flock"
         fi
       else
-        say "note: run-queued needs flock. Install Homebrew (https://brew.sh), then: brew install flock"
+        say "note: deli needs flock. Install Homebrew (https://brew.sh), then: brew install flock"
       fi
     fi
     ;;
@@ -96,21 +101,21 @@ case "$OS" in
     die "native Windows isn't supported yet. Install it inside WSL instead:
   https://learn.microsoft.com/windows/wsl/install
 A native Windows build may come later if people ask for it:
-  https://github.com/mstelz/run-queued/issues"
+  https://github.com/mstelz/deli-counter/issues"
     ;;
   *) die "unsupported system: $OS (Linux and macOS only)" ;;
 esac
 command -v python3 >/dev/null ||
-  say "note: python3 is missing. run-queued works without it; queue-dash needs it."
+  say "note: python3 is missing. deli works without it; deli-counter needs it."
 
 # Run from a clone: use it. Piped from curl: there is no script file, so clone or update.
 SRC=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  [ -f "$d/run-queued" ] && SRC="$d"
+  [ -f "$d/deli" ] && SRC="$d"
 fi
 if [ -z "$SRC" ]; then
-  command -v git >/dev/null || die "git is needed to download run-queued"
+  command -v git >/dev/null || die "git is needed to download deli-counter"
   if [ -d "$CLONE_DIR/.git" ]; then
     say "Updating $(tilde "$CLONE_DIR")"
     git -C "$CLONE_DIR" pull --ff-only --quiet
@@ -122,11 +127,17 @@ if [ -z "$SRC" ]; then
 fi
 
 say "Linking:"
-link "$SRC/run-queued" "$BIN_DIR/run-queued"
-link "$SRC/queue-dash" "$BIN_DIR/queue-dash"
+link "$SRC/deli" "$BIN_DIR/deli"
+link "$SRC/deli-counter" "$BIN_DIR/deli-counter"
+link "$SRC/deli-counter" "$BIN_DIR/deli-dash"
+# Backward compatibility symlinks so existing scripts/agents do not break:
+link "$SRC/deli" "$BIN_DIR/run-queued"
+link "$SRC/deli-counter" "$BIN_DIR/queue-dash"
+
 if [ -d "$HOME/.claude" ]; then
-  if [ -L "$SKILL" ] || ask "Add the Claude Code skill that tells Claude to use the queue?" y; then
-    link "$SRC/skills/run-queued/SKILL.md" "$SKILL"
+  if [ -L "$SKILL" ] || ask "Add the Claude Code skill that tells Claude to use the deli queue?" y; then
+    link "$SRC/skills/deli/SKILL.md" "$SKILL"
+    [ -L "$LEGACY_SKILL" ] && link "$SRC/skills/deli/SKILL.md" "$LEGACY_SKILL"
   fi
 fi
 
@@ -137,4 +148,4 @@ case ":$PATH:" in
      say "  export PATH=\"$BIN_DIR:\$PATH\""
      say "" ;;
 esac
-say "Installed. Try:  run-queued -- sleep 5   and   queue-dash"
+say "Installed. Try:  deli -- sleep 5   and   deli-counter"

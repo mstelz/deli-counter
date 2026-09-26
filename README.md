@@ -1,15 +1,15 @@
-# run-queued
+# deli-counter
 
 I run a lot of coding agents on one machine. They all start test runs and builds at the same
 time, the machine runs out of CPU and memory, and half the runs get killed partway through.
 
 This is a small fix for that:
 
-- `run-queued` makes heavy commands wait for a free slot, so only a few run at once.
-- `queue-dash` is a terminal dashboard showing what's running, what's waiting, and how loaded
+- `deli` makes heavy commands take a ticket and wait for a free slot at the counter, so only a few run at once.
+- `deli-counter` is a terminal dashboard showing what's running, what's waiting, and how loaded
   the machine is.
 
-![queue-dash](screenshots/queue-dash.png)
+![deli-counter](screenshots/deli-counter.png)
 
 Works on Linux and macOS. It needs bash, `flock` and python3 (for the dashboard only). Linux
 has `flock` already; on macOS the installer offers to `brew install flock` for you. Nothing
@@ -17,44 +17,45 @@ else to install: the dashboard only uses Python's standard library.
 
 On Windows, use it inside [WSL](https://learn.microsoft.com/windows/wsl/install). A native
 Windows version would mean rewriting both tools as a single compiled program, which I'll do if
-people want it, so [open an issue](https://github.com/mstelz/run-queued/issues) if that's you.
+people want it, so [open an issue](https://github.com/mstelz/deli-counter/issues) if that's you.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mstelz/run-queued/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mstelz/deli-counter/main/install.sh | bash
 ```
 
-This clones the repo to `~/.local/share/run-queued` and symlinks `run-queued` and `queue-dash`
-into `~/.local/bin`. It asks before installing anything else (flock on macOS, and the Claude
-Code skill if you use Claude Code). Add `-s -- -y` after `bash` to say yes to everything. Run
-the same command again to update.
+This clones the repo to `~/.local/share/deli-counter` and symlinks `deli` and `deli-counter`
+into `~/.local/bin`. (It also adds `run-queued` and `queue-dash` aliases for backward compatibility).
+It asks before installing anything else (flock on macOS, and the Claude Code skill if you use Claude Code).
+Add `-s -- -y` after `bash` to say yes to everything. Run the same command again to update.
 
 Or from a clone:
 
 ```bash
-git clone https://github.com/mstelz/run-queued.git
-cd run-queued && ./install.sh
+git clone https://github.com/mstelz/deli-counter.git
+cd deli-counter && ./install.sh
 ```
 
-To remove it: `./install.sh --uninstall` (or `~/.local/share/run-queued/install.sh --uninstall`).
+To remove it: `./install.sh --uninstall` (or `~/.local/share/deli-counter/install.sh --uninstall`).
 
-## run-queued
+## deli
 
 Put it in front of anything heavy:
 
 ```bash
-run-queued -- npm test
-run-queued --label api-build -- cargo build --release
+deli -- npm test
+deli --label api-build -- cargo build --release
 ```
 
-It waits until it's this command's turn, runs it, and exits with the command's exit code. Other
+It waits until it's this command's turn at the counter, runs it, and exits with the command's exit code. Other
 commands:
 
 ```bash
-run-queued --status     # what's running and what's waiting
-run-queued --slots      # how many things can run at once (default 2)
-run-queued --slots 3    # change it for the whole machine
+deli --status     # what's running and what's waiting
+deli --slots      # how many things can run at once (default 2)
+deli --slots 3    # change it for the whole machine
+deli              # running with no arguments opens the deli-counter dashboard
 ```
 
 A few details:
@@ -66,9 +67,9 @@ A few details:
 - Changing the slot count takes effect within a few seconds. Lowering it doesn't stop anything
   already running; those runs just finish.
 
-Environment variables, if you need them: `AGENT_QUEUE_DIR` (where the queue keeps its files,
-default `/tmp/agent-queue`), `AGENT_QUEUE_SLOTS` (starting slot count if you never set one),
-`AGENT_QUEUE_POLL_SECONDS` (how often waiting runs check for a slot, default 5).
+Environment variables, if you need them: `DELI_QUEUE_DIR` / `AGENT_QUEUE_DIR` (where the queue keeps its files,
+default `/tmp/agent-queue`), `DELI_QUEUE_SLOTS` / `AGENT_QUEUE_SLOTS` (starting slot count if you never set one),
+`DELI_QUEUE_POLL_SECONDS` / `AGENT_QUEUE_POLL_SECONDS` (how often waiting runs check for a slot, default 5).
 
 ## Getting agents to use it
 
@@ -77,18 +78,18 @@ For other agents, or to be safe, add something like this to your `CLAUDE.md`, `A
 `GEMINI.md`:
 
 ```markdown
-# Heavy commands go through the work queue
+# Heavy commands go through the deli
 This machine runs many agents at once and kills overloaded work. Run anything CPU- or
 memory-heavy (tests, typecheck, lint, builds, docker, headless browsers) as
-`run-queued -- <command>`. It waits for a free slot, so give it a long timeout or run it in the
-background. A run that dies with no failed test is load: re-run it queued before debugging.
+`deli -- <command>`. It waits for a free counter slot, so give it a long timeout or run it in the
+background. A run that dies with no failed test is load: re-run it through the deli before debugging.
 ```
 
-## queue-dash
+## deli-counter
 
 ```bash
-queue-dash           # full screen, updates every second
-queue-dash --once    # print a snapshot and exit
+deli-counter           # full screen, updates every second
+deli-counter --once    # print a snapshot and exit
 ```
 
 The top line shows slots in use, how many runs are waiting, load, and free memory. The line

@@ -12,31 +12,32 @@
 # Locks are flock(1) locks: the kernel releases them when the process exits, killed or not, so a
 # dead run never leaves a stale lock behind.
 #
-# N is live: the queue's `slots` file (written by `run-queued --slots N` or queue-dash) wins, then
-# AGENT_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
+# N is live: the queue's `slots` file (written by `deli --slots N` or deli-counter) wins, then
+# DELI_QUEUE_SLOTS / AGENT_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
 # Lowering it never stops a running command; it only keeps new runs out of the slots above N.
 #
 # Runs on Linux and macOS (bash 3.2 or later). macOS needs flock: `brew install flock`.
 #
 # Usage:
-#   run-queued [--label <text>] -- <command> [args...]
-#   run-queued --status
-#   run-queued --slots [N]       print, or set, the machine-wide slot count
+#   deli [--label <text>] -- <command> [args...]
+#   deli --status
+#   deli --slots [N]       print, or set, the machine-wide slot count
+#   deli                   (interactive) opens the deli-counter dashboard
 set -euo pipefail
 
-QUEUE_DIR="${AGENT_QUEUE_DIR:-/tmp/agent-queue}"
+QUEUE_DIR="${DELI_QUEUE_DIR:-${AGENT_QUEUE_DIR:-/tmp/agent-queue}}"
 SLOTS_FILE="$QUEUE_DIR/slots"
-POLL_SECONDS="${AGENT_QUEUE_POLL_SECONDS:-5}"
+POLL_SECONDS="${DELI_QUEUE_POLL_SECONDS:-${AGENT_QUEUE_POLL_SECONDS:-5}}"
 mkdir -p "$QUEUE_DIR"
 command -v flock >/dev/null || {
-  echo "run-queued: flock not found (macOS: brew install flock; Linux: it is in util-linux)" >&2
+  echo "deli: flock not found (macOS: brew install flock; Linux: it is in util-linux)" >&2
   exit 127
 }
 
 slot_count() {
   local n
   n="$(cat "$SLOTS_FILE" 2>/dev/null || true)"
-  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n="${AGENT_QUEUE_SLOTS:-2}"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n="${DELI_QUEUE_SLOTS:-${AGENT_QUEUE_SLOTS:-2}}"
   echo "$n"
 }
 
@@ -73,10 +74,19 @@ status() {
   done
 }
 
+if [ $# -eq 0 ]; then
+  if [ -t 0 ] && [ -t 1 ] && command -v deli-counter >/dev/null 2>&1; then
+    exec deli-counter
+  fi
+  echo "usage: $0 [--label <text>] -- <command> [args...]   |   $0 --status   |   $0 --slots [N]" >&2
+  echo "       $0 (interactive) opens the deli-counter dashboard" >&2
+  exit 2
+fi
+
 if [ "${1:-}" = "--status" ]; then status; exit 0; fi
 if [ "${1:-}" = "--slots" ]; then
   if [ $# -lt 2 ]; then slot_count; exit 0; fi
-  [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "run-queued: --slots needs a positive integer" >&2; exit 2; }
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "deli: --slots needs a positive integer" >&2; exit 2; }
   # Write then rename, so a poller never reads a half-written file.
   printf '%s\n' "$2" >"$SLOTS_FILE.$$" && mv -f "$SLOTS_FILE.$$" "$SLOTS_FILE"
   echo "slots: $2"
@@ -90,7 +100,7 @@ if [ "${1:-}" != "--" ]; then
   exit 2
 fi
 shift
-[ $# -gt 0 ] || { echo "run-queued: no command given" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "deli: no command given" >&2; exit 2; }
 
 WORKTREE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # sha1sum on Linux, shasum on macOS: the same SHA-1, so a checkout's lock name matches on both.
@@ -103,7 +113,7 @@ trap 'rm -f "$WAIT_FILE"' EXIT
 # 1. The checkout lock (blocking). fd 8 is held until this script exits.
 exec 8>"$QUEUE_DIR/worktree-$WT_KEY.lock"
 if ! flock -n 8; then
-  echo "run-queued: waiting for another run in this checkout ($WORKTREE)" >&2
+  echo "deli: waiting for another run in this checkout ($WORKTREE)" >&2
   echo "$DESC (checkout)" >"$WAIT_FILE"
   flock 8
 fi
@@ -117,7 +127,7 @@ while :; do
     if flock -n 9; then
       rm -f "$WAIT_FILE"
       echo "$DESC" >"$QUEUE_DIR/slot-$i.info"
-      [ "$announced" = 1 ] && echo "run-queued: got slot $i" >&2
+      [ "$announced" = 1 ] && echo "deli: got slot $i" >&2
       # Run as a child, not exec: fds 8 and 9 stay held by this shell until the command ends.
       set +e
       "$@" 8>&- 9>&-   # the child must not inherit the locks, or a daemon it leaves behind would hold them
@@ -129,7 +139,7 @@ while :; do
     exec 9>&-
   done
   if [ "$announced" = 0 ]; then
-    echo "run-queued: all $SLOTS slots busy; queued (see: $0 --status)" >&2
+    echo "deli: all $SLOTS slots busy; queued (see: $0 --status)" >&2
     echo "$DESC" >"$WAIT_FILE"
     announced=1
   fi

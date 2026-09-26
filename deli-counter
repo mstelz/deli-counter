@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Live terminal dashboard for the run-queued work queue.
+"""Live terminal dashboard for the deli-counter work queue.
 
-run-queued keeps its state as plain files in $AGENT_QUEUE_DIR (default /tmp/agent-queue):
+deli keeps its state as plain files in $DELI_QUEUE_DIR / $AGENT_QUEUE_DIR (default /tmp/agent-queue):
   slot-N.info    "pid P · label · HH:MM:SS · command" while slot N is running, empty when free
   wait-P.info    the same line for a queued run, suffixed " (checkout)" when it waits on its
                  own checkout's lock rather than on a machine-wide slot
-  slots          the live slot count, if set; run-queued re-reads it on every poll
+  slots          the live slot count, if set; deli re-reads it on every poll
 A killed run can leave either file behind, so an entry counts only while its pid is alive and
-is still a run-queued process. The dashboard never touches the locks. The one thing it writes is
+is still a deli process. The dashboard never touches the locks. The one thing it writes is
 the slots file, when you change the slot count.
 
-Beyond what `run-queued --status` prints, it measures real run and wait times, the CPU and
+Beyond what `deli --status` prints, it measures real run and wait times, the CPU and
 memory of each run's whole process tree, machine load and memory, and a history of runs that
 finished while the dashboard was open. Linux and macOS; Python 3 standard library only.
 
-Usage: queue-dash [--interval SECONDS] [--once]
+Usage: deli-counter [--interval SECONDS] [--once]
 Keys:  ? help · q quit · r refresh now · + / - slot count · [ / ] refresh interval
        Tab browse finished runs (↑↓ PgUp PgDn Home End, Enter details, Esc back)
 """
@@ -29,9 +29,9 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-QUEUE_DIR = os.environ.get("AGENT_QUEUE_DIR", "/tmp/agent-queue")
+QUEUE_DIR = os.environ.get("DELI_QUEUE_DIR", os.environ.get("AGENT_QUEUE_DIR", "/tmp/agent-queue"))
 SLOTS_FILE = os.path.join(QUEUE_DIR, "slots")
-DEFAULT_SLOTS = int(os.environ.get("AGENT_QUEUE_SLOTS", "2"))
+DEFAULT_SLOTS = int(os.environ.get("DELI_QUEUE_SLOTS", os.environ.get("AGENT_QUEUE_SLOTS", "2")))
 MAX_SLOTS = 64
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -142,10 +142,12 @@ def tree(pid, kids):
 
 def is_run_queued(pid, procs):
     if not LINUX:
-        return "run-queued" in procs[pid].args
+        args = procs[pid].args
+        return "deli" in args or "run-queued" in args
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return b"run-queued" in f.read()
+            cmd = f.read()
+            return b"deli" in cmd or b"run-queued" in cmd
     except OSError:
         return False
 
@@ -167,7 +169,7 @@ _checkouts = {}  # pid -> checkout; a run's cwd never changes, and lsof is slow 
 
 
 def checkout_of(pid):
-    """The checkout run-queued keys its per-checkout lock on: git toplevel of its cwd, else cwd."""
+    """The checkout deli keys its per-checkout lock on: git toplevel of its cwd, else cwd."""
     if pid in _checkouts:
         return _checkouts[pid]
     d = cwd_of(pid)
@@ -246,7 +248,7 @@ class Entry:
     pid: int
     label: str
     command: str
-    submitted: float  # when run-queued started (epoch)
+    submitted: float  # when deli started (epoch)
     checkout_wait: bool = False
     slot: int = 0
     run_start: float = 0.0  # when the command itself started (epoch), slots only
@@ -281,7 +283,7 @@ def read_file(path):
 
 
 def slot_limit():
-    """The live slot count, read as run-queued reads it: slots file, then AGENT_QUEUE_SLOTS, then 2."""
+    """The live slot count, read as deli reads it: slots file, then AGENT_QUEUE_SLOTS, then 2."""
     text = read_file(SLOTS_FILE).strip()
     return int(text) if re.fullmatch(r"[1-9][0-9]*", text) else DEFAULT_SLOTS
 
@@ -320,7 +322,7 @@ class Snapshot:
 class Sampler:
     prev_cpu: dict = field(default_factory=dict)
     prev_at: float = 0.0
-    running: dict = field(default_factory=dict)  # run-queued pid -> Entry, to detect finishes
+    running: dict = field(default_factory=dict)  # deli pid -> Entry, to detect finishes
     history: deque = field(default_factory=lambda: deque(maxlen=500))
     finished: int = 0  # total ever added to history, so a view can tell how many are new
 
@@ -334,7 +336,7 @@ class Sampler:
 
         def measure(e):
             pids = [p for p in tree(e.pid, kids) if p in procs]
-            e.nprocs = len(pids) - 1  # not counting run-queued itself
+            e.nprocs = len(pids) - 1  # not counting deli itself
             e.rss = sum(procs[p].rss for p in pids)
             total = 0
             for p in pids:
@@ -526,7 +528,7 @@ def advice(snap, busy):
 
 
 HELP = [
-    [(" queue-dash help", "title"), ("   any key closes", "dim")],
+    [(" deli-counter help", "title"), ("   any key closes", "dim")],
     [],
     [(" HEADER", "title")],
     [("  slots busy    ", ""), ("running jobs / the slot limit. Each slot runs one heavy command.", "dim")],
@@ -568,7 +570,7 @@ def top_rows(snap):
                                     "bad" if sw_frac > 0.8 else "warn" if sw_frac > 0.4 else "")]
 
     rows.append([
-        (" run-queued ", "title"),
+        (" deli-counter ", "title"),
         (f"  {busy}/{snap.nslots} slots busy", "busy" if busy >= snap.nslots else "free"),
         (f"  {len(snap.waiting)} waiting", "wait" if snap.waiting else "dim"),
         ("   load ", "dim"),
@@ -653,7 +655,7 @@ def finished_detail(ended, e):
         [("      slot ", "dim"), (f"{e.slot}", ""), ("  pid ", "dim"), (f"{e.pid}", ""),
          ("  queued ", "dim"), (clock(e.submitted), ""), ("  started ", "dim"),
          (clock(e.run_start), ""), ("  ended ", "dim"), (clock(ended), ""),
-         ("  exit code not recorded by run-queued", "dim")],
+         ("  exit code not recorded by deli", "dim")],
     ]
 
 
@@ -713,15 +715,31 @@ class FinishedView:
 
 
 def run_curses(stdscr, interval, demo=False):
-    curses.curs_set(0)
-    curses.use_default_colors()
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    has_colors = False
+    try:
+        if curses.has_colors():
+            curses.use_default_colors()
+            has_colors = True
+    except curses.error:
+        pass
     pairs = {"title": curses.COLOR_CYAN, "busy": curses.COLOR_GREEN, "free": curses.COLOR_BLUE,
              "warn": curses.COLOR_YELLOW, "bad": curses.COLOR_RED, "wait": curses.COLOR_MAGENTA,
              "check": curses.COLOR_YELLOW}
     styles = {"": curses.A_NORMAL, "dim": curses.A_DIM}
-    for n, (name, color) in enumerate(pairs.items(), 1):
-        curses.init_pair(n, color, -1)
-        styles[name] = curses.color_pair(n) | (curses.A_BOLD if name in ("title", "bad") else 0)
+    if has_colors:
+        for n, (name, color) in enumerate(pairs.items(), 1):
+            try:
+                curses.init_pair(n, color, -1)
+                styles[name] = curses.color_pair(n) | (curses.A_BOLD if name in ("title", "bad") else 0)
+            except curses.error:
+                styles[name] = curses.A_BOLD if name in ("title", "bad") else curses.A_NORMAL
+    else:
+        for name in pairs:
+            styles[name] = curses.A_BOLD if name in ("title", "bad") else curses.A_NORMAL
 
     def draw(y, row, w, extra=0):
         x = 0
@@ -866,7 +884,7 @@ def run_curses(stdscr, interval, demo=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Live dashboard for the run-queued work queue.")
+    ap = argparse.ArgumentParser(description="Live dashboard for the deli-counter work queue.")
     ap.add_argument("-n", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
     ap.add_argument("--demo", action="store_true", help="run with mock data for demonstration")
