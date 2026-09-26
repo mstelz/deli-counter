@@ -390,6 +390,87 @@ class Sampler:
         return Snapshot(now, nslots, slots, waiting, machine(), ok)
 
 
+@dataclass
+class DemoSampler:
+    """Mock sampler providing realistic data for demonstration and screenshots."""
+    nslots: int = 4
+    finished: int = 3
+    history: deque = field(default_factory=deque)
+    start_time: float = field(default_factory=time.time)
+
+    def __post_init__(self):
+        t = self.start_time
+        self.history = deque([
+            (t - 28, Entry(
+                pid=41205, label="docs-site", command="pnpm build",
+                submitted=t - 55, run_start=t - 50, slot=2,
+                checkout="/home/mike/Development/docs-site"
+            )),
+            (t - 107, Entry(
+                pid=40891, label="core-utils", command="cargo test",
+                submitted=t - 240, run_start=t - 212, slot=1,
+                checkout="/home/mike/Development/core-utils"
+            )),
+            (t - 290, Entry(
+                pid=40120, label="auth-service", command="pytest tests/test_auth.py",
+                submitted=t - 342, run_start=t - 341, slot=1,
+                checkout="/home/mike/Development/auth-service"
+            )),
+        ], maxlen=500)
+
+    def sample(self):
+        now = time.time()
+        e1 = Entry(
+            pid=42310, label="api-service", command="cargo test --release",
+            submitted=self.start_time - 47, run_start=self.start_time - 42, slot=1,
+            checkout="/home/mike/Development/api-service",
+            cpu=185.0, rss=412 * 1024 * 1024, nprocs=8
+        )
+        e2 = Entry(
+            pid=42405, label="web-frontend", command="pnpm --filter web test:e2e",
+            submitted=self.start_time - 87, run_start=self.start_time - 75, slot=2,
+            checkout="/home/mike/Development/web-frontend",
+            cpu=94.0, rss=285 * 1024 * 1024, nprocs=4
+        )
+        e3 = Entry(
+            pid=42512, label="data-pipeline", command="python -m pytest tests/unit -n auto",
+            submitted=self.start_time - 20, run_start=self.start_time - 18, slot=3,
+            checkout="/home/mike/Development/data-pipeline",
+            cpu=240.0, rss=620 * 1024 * 1024, nprocs=6
+        )
+        slots = {}
+        for i in range(1, self.nslots + 1):
+            if i == 1:
+                slots[1] = e1
+            elif i == 2:
+                slots[2] = e2
+            elif i == 3 and self.nslots >= 3:
+                slots[3] = e3
+            else:
+                slots[i] = None
+
+        w1 = Entry(
+            pid=42601, label="worker-service", command="cargo build --release",
+            submitted=self.start_time - 35, checkout_wait=False,
+            checkout="/home/mike/Development/worker-service"
+        )
+        w2 = Entry(
+            pid=42680, label="api-service", command="cargo clippy --all-targets",
+            submitted=self.start_time - 14, checkout_wait=True,
+            checkout="/home/mike/Development/api-service", blocked_by=1
+        )
+        waiting = [w1, w2]
+
+        mach = {
+            "load": (2.8, 2.1, 1.4),
+            "mem_total": 32 * 1024 * 1024 * 1024,
+            "mem_avail": int(12.4 * 1024 * 1024 * 1024),
+            "swap_used": int(1.1 * 1024 * 1024 * 1024),
+            "swap_total": 8 * 1024 * 1024 * 1024,
+        }
+        return Snapshot(now, self.nslots, slots, waiting, mach, ok=True)
+
+
 # ---------------------------------------------------------------- formatting
 
 
@@ -579,10 +660,11 @@ def finished_detail(ended, e):
 # ---------------------------------------------------------------- output
 
 
-def print_once():
-    s = Sampler()
+def print_once(demo=False):
+    s = DemoSampler() if demo else Sampler()
     s.sample()
-    time.sleep(0.5)  # a second sample so cpu% has an interval to measure
+    if not demo:
+        time.sleep(0.5)  # a second sample so cpu% has an interval to measure
     snap = s.sample()
     rows = top_rows(snap) + [[(" FINISHED ", "title"), ("since this dashboard opened", "dim")]]
     rows += [finished_row(ended, e) for ended, e in s.history] or [[("  none yet", "dim")]]
@@ -630,7 +712,7 @@ class FinishedView:
         self.top = max(0, min(self.top, len(lines) - height))
 
 
-def run_curses(stdscr, interval):
+def run_curses(stdscr, interval, demo=False):
     curses.curs_set(0)
     curses.use_default_colors()
     pairs = {"title": curses.COLOR_CYAN, "busy": curses.COLOR_GREEN, "free": curses.COLOR_BLUE,
@@ -658,7 +740,7 @@ def run_curses(stdscr, interval):
                 pass
             x += len(text)
 
-    sampler = Sampler()
+    sampler = DemoSampler() if demo else Sampler()
     snap = sampler.sample()
     view = FinishedView()
     view.seen = sampler.finished
@@ -735,14 +817,18 @@ def run_curses(stdscr, interval):
         elif key == 9:  # Tab
             view.focus = not view.focus and bool(sampler.history)
         elif key in (ord("+"), ord("=")) or key in (ord("-"), ord("_")):
-            old = slot_limit()
+            old = sampler.nslots if demo else slot_limit()
             new = max(1, min(MAX_SLOTS, old + (1 if key in (ord("+"), ord("=")) else -1)))
             if new != old:
-                try:
-                    set_slot_limit(new)
-                    flash = f"slots {old} → {new} (machine-wide; running jobs are never stopped)"
-                except OSError as err:
-                    flash = f"could not write {SLOTS_FILE}: {err.strerror}"
+                if demo:
+                    sampler.nslots = new
+                    flash = f"slots {old} → {new} (demo mode)"
+                else:
+                    try:
+                        set_slot_limit(new)
+                        flash = f"slots {old} → {new} (machine-wide; running jobs are never stopped)"
+                    except OSError as err:
+                        flash = f"could not write {SLOTS_FILE}: {err.strerror}"
             else:
                 flash = f"slots already at {'minimum' if new == 1 else 'maximum'} ({new})"
             flash_until = time.time() + 2.5
@@ -783,13 +869,14 @@ def main():
     ap = argparse.ArgumentParser(description="Live dashboard for the run-queued work queue.")
     ap.add_argument("-n", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--demo", action="store_true", help="run with mock data for demonstration")
     args = ap.parse_args()
     if args.once or not sys.stdout.isatty():
-        print_once()
+        print_once(demo=args.demo)
         return
     os.environ.setdefault("ESCDELAY", "25")
     try:
-        curses.wrapper(run_curses, max(0.25, args.interval))
+        curses.wrapper(run_curses, max(0.25, args.interval), args.demo)
     except KeyboardInterrupt:
         pass
 

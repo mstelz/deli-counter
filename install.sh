@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Install run-queued and queue-dash on Linux or macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/mstelz/queue-dash/main/install.sh | bash
-#       clones to ~/.local/share/queue-dash (or updates it), then links the tools
+#   curl -fsSL https://raw.githubusercontent.com/mstelz/run-queued/main/install.sh | bash
+#       clones to ~/.local/share/run-queued (or updates it), then links the tools
 #   ./install.sh               from a clone: links the tools from this folder
 #   ./install.sh --uninstall   removes the links
 #   -y, --yes                  answer yes to every question (with curl: ... | bash -s -- -y)
@@ -11,8 +11,8 @@
 # updates them. The Claude Code skill is linked into ~/.claude/skills if you want it.
 set -euo pipefail
 
-REPO="${QUEUE_DASH_REPO:-https://github.com/mstelz/queue-dash.git}"
-CLONE_DIR="${QUEUE_DASH_DIR:-$HOME/.local/share/queue-dash}"
+REPO="${RUN_QUEUED_REPO:-${QUEUE_DASH_REPO:-https://github.com/mstelz/run-queued.git}}"
+CLONE_DIR="${RUN_QUEUED_DIR:-${QUEUE_DASH_DIR:-$HOME/.local/share/run-queued}}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 SKILL="$HOME/.claude/skills/run-queued/SKILL.md"
 
@@ -96,7 +96,7 @@ case "$OS" in
     die "native Windows isn't supported yet. Install it inside WSL instead:
   https://learn.microsoft.com/windows/wsl/install
 A native Windows build may come later if people ask for it:
-  https://github.com/mstelz/queue-dash/issues"
+  https://github.com/mstelz/run-queued/issues"
     ;;
   *) die "unsupported system: $OS (Linux and macOS only)" ;;
 esac
@@ -110,7 +110,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   [ -f "$d/run-queued" ] && SRC="$d"
 fi
 if [ -z "$SRC" ]; then
-  command -v git >/dev/null || die "git is needed to download queue-dash"
+  command -v git >/dev/null || die "git is needed to download run-queued"
   if [ -d "$CLONE_DIR/.git" ]; then
     say "Updating $(tilde "$CLONE_DIR")"
     git -C "$CLONE_DIR" pull --ff-only --quiet

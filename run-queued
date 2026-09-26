@@ -66,7 +66,10 @@ status() {
   for f in "$QUEUE_DIR"/wait-*.info; do
     [ -e "$f" ] || continue
     # A waiter that was killed leaves its file behind; show only live ones.
-    kill -0 "$(basename "$f" .info | sed 's/^wait-//')" 2>/dev/null && echo "  $(cat "$f")"
+    w_pid="$(basename "$f" .info | sed 's/^wait-//')"
+    if kill -0 "$w_pid" 2>/dev/null; then
+      echo "  $(cat "$f")"
+    fi
   done
 }
 

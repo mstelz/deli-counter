@@ -1,4 +1,4 @@
-# queue-dash
+# run-queued
 
 I run a lot of coding agents on one machine. They all start test runs and builds at the same
 time, the machine runs out of CPU and memory, and half the runs get killed partway through.
@@ -9,21 +9,23 @@ This is a small fix for that:
 - `queue-dash` is a terminal dashboard showing what's running, what's waiting, and how loaded
   the machine is.
 
+![queue-dash](screenshots/queue-dash.png)
+
 Works on Linux and macOS. It needs bash, `flock` and python3 (for the dashboard only). Linux
 has `flock` already; on macOS the installer offers to `brew install flock` for you. Nothing
 else to install: the dashboard only uses Python's standard library.
 
 On Windows, use it inside [WSL](https://learn.microsoft.com/windows/wsl/install). A native
 Windows version would mean rewriting both tools as a single compiled program, which I'll do if
-people want it, so [open an issue](https://github.com/mstelz/queue-dash/issues) if that's you.
+people want it, so [open an issue](https://github.com/mstelz/run-queued/issues) if that's you.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mstelz/queue-dash/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mstelz/run-queued/main/install.sh | bash
 ```
 
-This clones the repo to `~/.local/share/queue-dash` and symlinks `run-queued` and `queue-dash`
+This clones the repo to `~/.local/share/run-queued` and symlinks `run-queued` and `queue-dash`
 into `~/.local/bin`. It asks before installing anything else (flock on macOS, and the Claude
 Code skill if you use Claude Code). Add `-s -- -y` after `bash` to say yes to everything. Run
 the same command again to update.
@@ -31,11 +33,11 @@ the same command again to update.
 Or from a clone:
 
 ```bash
-git clone https://github.com/mstelz/queue-dash.git
-cd queue-dash && ./install.sh
+git clone https://github.com/mstelz/run-queued.git
+cd run-queued && ./install.sh
 ```
 
-To remove it: `./install.sh --uninstall` (or `~/.local/share/queue-dash/install.sh --uninstall`).
+To remove it: `./install.sh --uninstall` (or `~/.local/share/run-queued/install.sh --uninstall`).
 
 ## run-queued
 
