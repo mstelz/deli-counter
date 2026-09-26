@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Measure how heavy a command is on this machine, and remember it.
+
+deli calls this; you normally type `deli inspect ...` rather than running it yourself.
+
+A profile is one command (its exact arguments) run from one folder. Each measured run records
+its wall time, CPU time, peak cores and peak memory of the whole process tree. Profiles are
+kept per machine, in $DELI_STATE_DIR (default ~/.local/state/deli)/profiles-<machine>.json,
+where <machine> is a short hash of the machine id. That way a home folder shared between
+machines never mixes a laptop's numbers with a workstation's.
+
+The class is worked out when it is read, from the worst of the last few successful runs,
+against this machine's size (cores and memory):
+  light   small next to the machine: runs without waiting for a slot
+  medium  noticeable: queue it
+  heavy   a large share of the machine: queue it
+Failed runs are not saved, because a run that stops early looks lighter than it is.
+
+Usage:
+  deli-inspect run [--quiet] -- <command> [args...]   run, measure, save; exits with its code
+  deli-inspect class -- <command> [args...]           print the class; exit 0 only if light
+  deli-inspect show -- <command> [args...]            print the saved profile
+  deli-inspect forget -- <command> [args...]          delete the saved profile
+  deli-inspect list                                   every profile on this machine
+Commands are looked up by the current folder plus their exact arguments.
+"""
+
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import resource
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.environ.get("DELI_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "deli")
+KEEP_RUNS = 5  # the class is judged on the worst of these
+
+# Class limits, as a share of this machine. A run is light only if it is under every light
+# limit, and heavy if it is over any heavy limit.
+LIGHT_CPU_SECONDS = 15.0  # total CPU time, all processes
+LIGHT_AVG_CORES = 0.10  # of the machine's cores, but always at least 1 core
+LIGHT_PEAK_CORES = 0.25  # of the machine's cores, but always at least 2 cores
+LIGHT_MEM = 0.05  # of total memory
+HEAVY_CORES = 0.50  # peak, of the machine's cores
+HEAVY_MEM = 0.25  # peak, of total memory
+
+
+def load_counter():
+    """deli-counter already knows how to read processes and memory on Linux and macOS."""
+    path = os.path.join(HERE, "deli-counter")
+    loader = importlib.machinery.SourceFileLoader("deli_counter", path)
+    spec = importlib.util.spec_from_loader("deli_counter", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+dc = load_counter()
+
+
+# ---------------------------------------------------------------- this machine
+
+
+def read_first(*paths):
+    for p in paths:
+        try:
+            with open(p) as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except OSError:
+            pass
+    return ""
+
+
+def machine_id():
+    """A short, stable id for this machine. The raw id is hashed, so it never leaves here."""
+    raw = ""
+    if dc.LINUX:
+        raw = read_first("/etc/machine-id", "/var/lib/dbus/machine-id")
+    else:
+        for line in dc.run("ioreg", "-rd1", "-c", "IOPlatformExpertDevice").splitlines():
+            if "IOPlatformUUID" in line:
+                raw = line.split("=", 1)[1].strip().strip('"')
+    raw = raw or socket.gethostname()
+    return hashlib.sha256(("deli:" + raw).encode()).hexdigest()[:12]
+
+
+def machine_size():
+    return {"cpus": dc.NCPU, "mem_total": dc.machine()["mem_total"]}
+
+
+# ---------------------------------------------------------------- profile store
+
+
+def store_path():
+    return os.path.join(STATE_DIR, f"profiles-{machine_id()}.json")
+
+
+class Store:
+    """The profile file, locked for the life of the `with` so parallel runs don't lose writes."""
+
+    def __init__(self, write=False):
+        self.path, self.write = store_path(), write
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.lock = open(self.path + ".lock", "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX if self.write else fcntl.LOCK_SH)
+        try:
+            with open(self.path) as f:
+                self.data = json.load(f)
+        except (OSError, ValueError):
+            self.data = {}
+        self.data.setdefault("profiles", {})
+        return self
+
+    def __exit__(self, *exc):
+        if self.write and exc[0] is None:
+            self.data["machine"] = {"id": machine_id(), "host": socket.gethostname(), **machine_size()}
+            tmp = f"{self.path}.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+        self.lock.close()
+
+    @property
+    def profiles(self):
+        return self.data["profiles"]
+
+
+def key_of(cwd, argv):
+    return hashlib.sha1(json.dumps([cwd, argv]).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- measuring a run
+
+
+def measure(argv):
+    """Run argv with the terminal handed straight through, sampling its process tree.
+    Returns (exit code, run record)."""
+    interval = 0.5 if dc.LINUX else 1.0  # ps on macOS is slower than reading /proc
+    start = time.time()
+    try:
+        child = subprocess.Popen(argv)
+    except OSError as e:
+        print(f"deli: {argv[0]}: {e.strerror}", file=sys.stderr)
+        return 127, None
+    # Ctrl-C reaches the child through the terminal; we wait for it and report its exit code.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda *_: child.terminate())
+
+    seen_cpu = {}  # pid -> latest CPU seconds, to add up processes that have already ended
+    peak_mem = peak_cores = 0.0
+    prev_total, prev_at = 0.0, start
+    while True:
+        try:
+            child.wait(timeout=interval)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        procs = dc.read_procs()
+        pids = [p for p in dc.tree(child.pid, dc.children_map(procs)) if p in procs]
+        peak_mem = max(peak_mem, sum(procs[p].rss for p in pids))
+        for p in pids:
+            seen_cpu[p] = procs[p].cpu
+        total, now = sum(seen_cpu.values()), time.time()
+        peak_cores = max(peak_cores, (total - prev_total) / max(now - prev_at, 1e-3))
+        prev_total, prev_at = total, now
+    wall = time.time() - start
+
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = max(ru.ru_utime + ru.ru_stime, sum(seen_cpu.values()))
+    # A run too short to sample: fall back to its largest single process. Only then, because on
+    # Linux a child's ru_maxrss starts at this script's own size when it forks.
+    if not peak_mem:
+        peak_mem = ru.ru_maxrss * (1024 if dc.LINUX else 1)
+    peak_cores = min(max(peak_cores, cpu / wall if wall else 0.0), float(dc.NCPU))
+    rc = child.returncode
+    rc = 128 - rc if rc < 0 else rc  # killed by a signal: report it the way a shell does
+    return rc, {"at": int(start), "wall": round(wall, 2), "cpu": round(cpu, 2),
+                "peak_cores": round(peak_cores, 2), "peak_mem": int(peak_mem), "exit": rc}
+
+
+# ---------------------------------------------------------------- judging a profile
+
+
+def worst(runs):
+    return {k: max(r[k] for r in runs) for k in ("wall", "cpu", "peak_cores", "peak_mem")}
+
+
+def judge(runs, size):
+    """(class, reason) for these runs on a machine of this size."""
+    if not runs:
+        return "unknown", "never measured here"
+    w, cpus, mem = worst(runs), size["cpus"], size["mem_total"] or 1
+    avg_cores = w["cpu"] / w["wall"] if w["wall"] else 0.0
+    mem_share = w["peak_mem"] / mem
+    if mem_share >= HEAVY_MEM:
+        return "heavy", f"peak memory is {mem_share:.0%} of this machine's"
+    if w["peak_cores"] >= max(2.0, HEAVY_CORES * cpus):
+        return "heavy", f"peaks at {w['peak_cores']:.1f} of {cpus} cores"
+    over = []
+    if w["cpu"] > LIGHT_CPU_SECONDS:
+        over.append(f"{w['cpu']:.0f} s of CPU time")
+    if avg_cores > max(1.0, LIGHT_AVG_CORES * cpus):
+        over.append(f"{avg_cores:.1f} cores on average")
+    if w["peak_cores"] > max(2.0, LIGHT_PEAK_CORES * cpus):
+        over.append(f"peaks at {w['peak_cores']:.1f} cores")
+    if mem_share > LIGHT_MEM:
+        over.append(f"peak memory is {mem_share:.0%} of this machine's")
+    if over:
+        return "medium", "; ".join(over)
+    return "light", "small next to this machine"
+
+
+def advice(cls):
+    return {
+        "light": "runs straight away with `deli --`; no need to wait for a slot",
+        "medium": "keep it in the queue",
+        "heavy": "keep it in the queue",
+        "unknown": "run `deli inspect -- <command>` to measure it",
+    }[cls]
+
+
+def size_text(n):
+    return dc.size(n) if n else "0"
+
+
+def secs(s):
+    return f"{s:.1f}s" if s < 60 else dc.dur(s)
+
+
+def report(argv, cwd, runs, size, record=None, note=""):
+    cls, why = judge(runs, size)
+    lines = [f"deli inspect: {shlex.join(argv)}", f"  in          {cwd}"]
+    if record:
+        avg = record["cpu"] / record["wall"] if record["wall"] else 0.0
+        lines += [
+            f"  this run    {secs(record['wall'])} wall · {record['cpu']:.1f} s CPU "
+            f"(avg {avg:.1f}, peak {record['peak_cores']:.1f} cores) · "
+            f"{size_text(record['peak_mem'])} peak memory",
+        ]
+    if runs:
+        w = worst(runs)
+        lines.append(f"  worst of {len(runs)}  {secs(w['wall'])} wall · {w['cpu']:.1f} s CPU · "
+                     f"peak {w['peak_cores']:.1f} cores · {size_text(w['peak_mem'])}")
+    lines += [
+        f"  machine     {machine_id()} · {size['cpus']} cores · {size_text(size['mem_total'])}",
+        f"  class       {cls} ({why})",
+        f"              {advice(cls)}",
+    ]
+    if note:
+        lines.append(f"  note        {note}")
+    print("\n".join(lines), file=sys.stderr)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def split_argv(args):
+    quiet = False
+    while args and args[0] != "--":
+        if args[0] == "--quiet":
+            quiet = True
+            args = args[1:]
+        else:
+            sys.exit(f"deli-inspect: unknown option {args[0]}")
+    if not args[1:]:
+        sys.exit("deli-inspect: give the command after --")
+    return quiet, args[1:]
+
+
+def cmd_run(args):
+    quiet, argv = split_argv(args)
+    cwd = os.getcwd()
+    rc, record = measure(argv)
+    if record is None:
+        return rc
+    note = ""
+    with Store(write=True) as st:
+        prof = st.profiles.setdefault(key_of(cwd, argv), {"cwd": cwd, "argv": argv, "runs": []})
+        if rc == 0:
+            prof["runs"] = (prof["runs"] + [record])[-KEEP_RUNS:]
+        else:
+            note = f"not saved: it exited {rc}, and a run that stops early looks lighter than it is"
+        if not prof["runs"]:
+            del st.profiles[key_of(cwd, argv)]
+        runs = list(prof["runs"])
+    if not quiet:
+        report(argv, cwd, runs, machine_size(), record, note)
+    return rc
+
+
+def lookup(argv):
+    cwd = os.getcwd()
+    with Store() as st:
+        prof = st.profiles.get(key_of(cwd, argv))
+    return cwd, (prof or {}).get("runs", [])
+
+
+def cmd_class(args):
+    _, argv = split_argv(args)
+    _, runs = lookup(argv)
+    cls, why = judge(runs, machine_size())
+    print(f"{cls}\t{why}")
+    return 0 if cls == "light" else 1
+
+
+def cmd_show(args):
+    _, argv = split_argv(args)
+    cwd, runs = lookup(argv)
+    report(argv, cwd, runs, machine_size())
+    return 0
+
+
+def cmd_forget(args):
+    _, argv = split_argv(args)
+    with Store(write=True) as st:
+        gone = st.profiles.pop(key_of(os.getcwd(), argv), None)
+    print("deli: forgot it" if gone else "deli: nothing saved for that command here", file=sys.stderr)
+    return 0
+
+
+def cmd_list(_args):
+    size = machine_size()
+    with Store() as st:
+        profs = list(st.profiles.values())
+    print(f"machine {machine_id()} · {size['cpus']} cores · {size_text(size['mem_total'])} · {store_path()}")
+    if not profs:
+        print("  nothing measured yet: deli inspect -- <command>")
+        return 0
+    home = os.path.expanduser("~")
+    for p in sorted(profs, key=lambda p: (p["cwd"], p["argv"])):
+        cls, _ = judge(p["runs"], size)
+        w = worst(p["runs"])
+        cwd = "~" + p["cwd"][len(home):] if p["cwd"].startswith(home) else p["cwd"]
+        print(f"  {cls:<7} {w['cpu']:>7.1f} s CPU  {w['peak_cores']:>5.1f} cores  "
+              f"{size_text(w['peak_mem']):>9}  {cwd}  $ {shlex.join(p['argv'])}")
+    return 0
+
+
+def main():
+    cmds = {"run": cmd_run, "class": cmd_class, "show": cmd_show, "forget": cmd_forget, "list": cmd_list}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print(__doc__.split("Usage:")[1].rstrip(), file=sys.stderr)
+        return 2
+    return cmds[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

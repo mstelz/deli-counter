@@ -16,12 +16,23 @@
 # DELI_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
 # Lowering it never stops a running command; it only keeps new runs out of the slots above N.
 #
+# Light commands skip the slot. `deli inspect -- <command>` runs a command in the queue while
+# measuring its CPU and memory (deli-inspect, next to this script), and saves a profile for this
+# machine. Once a command's worst recent run is light for this machine, `deli -- <command>` from
+# the same folder still takes the checkout lock but runs without waiting for a slot. Those runs
+# are measured too, so a command that grows past light goes back into the queue on its own.
+# DELI_FASTPATH=0 turns this off.
+#
 # Runs on Linux and macOS (bash 3.2 or later). macOS needs flock: `brew install flock`.
 #
 # Usage:
 #   deli [--label <text>] -- <command> [args...]
 #   deli --status
 #   deli --slots [N]       print, or set, the machine-wide slot count
+#   deli inspect [--label <text>] -- <command> [args...]   run it in the queue and measure it
+#   deli inspect --show -- <command> [args...]             what is saved for it, and its class
+#   deli inspect --forget -- <command> [args...]
+#   deli inspect --list                                    every command measured on this machine
 #   deli                   (interactive) opens the deli-counter dashboard
 set -euo pipefail
 
@@ -33,6 +44,15 @@ command -v flock >/dev/null || {
   echo "deli: flock not found (macOS: brew install flock; Linux: it is in util-linux)" >&2
   exit 127
 }
+
+# deli-inspect lives next to the real script; deli itself is usually a symlink in ~/.local/bin.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  link="$(readlink "$self")"
+  case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+INSPECT="$(cd "$(dirname "$self")" && pwd)/deli-inspect"
+have_inspect() { [ -x "$INSPECT" ] && command -v python3 >/dev/null; }
 
 slot_count() {
   local n
@@ -78,7 +98,8 @@ if [ $# -eq 0 ]; then
   if [ -t 0 ] && [ -t 1 ] && command -v deli-counter >/dev/null 2>&1; then
     exec deli-counter
   fi
-  echo "usage: $0 [--label <text>] -- <command> [args...]   |   $0 --status   |   $0 --slots [N]" >&2
+  echo "usage: $0 [inspect] [--label <text>] -- <command> [args...]   |   $0 --status   |   $0 --slots [N]" >&2
+  echo "       $0 inspect --list | --show -- <command> | --forget -- <command>" >&2
   echo "       $0 (interactive) opens the deli-counter dashboard" >&2
   exit 2
 fi
@@ -93,10 +114,22 @@ if [ "${1:-}" = "--slots" ]; then
   exit 0
 fi
 
+MODE=run
+if [ "${1:-}" = "inspect" ]; then
+  shift
+  have_inspect || { echo "deli: inspect needs python3 and $INSPECT" >&2; exit 127; }
+  case "${1:-}" in
+    --list) exec "$INSPECT" list ;;
+    --show) shift; exec "$INSPECT" show "$@" ;;
+    --forget) shift; exec "$INSPECT" forget "$@" ;;
+  esac
+  MODE=inspect
+fi
+
 LABEL=""
 if [ "${1:-}" = "--label" ]; then LABEL="$2"; shift 2; fi
 if [ "${1:-}" != "--" ]; then
-  echo "usage: $0 [--label <text>] -- <command> [args...]   |   $0 --status" >&2
+  echo "usage: $0 [inspect] [--label <text>] -- <command> [args...]   |   $0 --status" >&2
   exit 2
 fi
 shift
@@ -110,12 +143,28 @@ DESC="pid $$ · ${LABEL:-$(basename "$WORKTREE")} · $(date +%H:%M:%S) · $*"
 WAIT_FILE="$QUEUE_DIR/wait-$$.info"
 trap 'rm -f "$WAIT_FILE"' EXIT
 
+# Measured light on this machine: skip the slot (but not the checkout lock, below).
+LIGHT=""
+if [ "$MODE" = run ] && [ "${DELI_FASTPATH:-1}" != 0 ] && have_inspect; then
+  LIGHT="$("$INSPECT" class -- "$@" 2>/dev/null)" || LIGHT=""
+fi
+
 # 1. The checkout lock (blocking). fd 8 is held until this script exits.
 exec 8>"$QUEUE_DIR/worktree-$WT_KEY.lock"
 if ! flock -n 8; then
   echo "deli: waiting for another run in this checkout ($WORKTREE)" >&2
   echo "$DESC (checkout)" >"$WAIT_FILE"
   flock 8
+fi
+
+if [ -n "$LIGHT" ]; then
+  echo "deli: light on this machine (${LIGHT#*	}); running without a slot" >&2
+  rm -f "$WAIT_FILE"
+  set +e
+  "$INSPECT" run --quiet -- "$@" 8>&-
+  rc=$?
+  set -e
+  exit "$rc"
 fi
 
 # 2. A machine-wide slot. Poll every slot without blocking, so we take whichever frees first.
@@ -130,7 +179,9 @@ while :; do
       [ "$announced" = 1 ] && echo "deli: got slot $i" >&2
       # Run as a child, not exec: fds 8 and 9 stay held by this shell until the command ends.
       set +e
-      "$@" 8>&- 9>&-   # the child must not inherit the locks, or a daemon it leaves behind would hold them
+      # The child must not inherit the locks, or a daemon it leaves behind would hold them.
+      if [ "$MODE" = inspect ]; then "$INSPECT" run -- "$@" 8>&- 9>&-
+      else "$@" 8>&- 9>&-; fi
       rc=$?
       set -e
       : >"$QUEUE_DIR/slot-$i.info"

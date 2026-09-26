@@ -16,11 +16,14 @@ deli -- pnpm --filter core test src/foo.test.ts
 deli --label my-task -- cargo build --release
 deli --status          # who holds each slot, who is waiting
 deli --slots           # the current machine-wide slot count
+deli inspect -- pnpm test          # run it in the queue and measure it on this machine
+deli inspect --show -- pnpm test   # its saved class here: light, medium, heavy or unknown
 ```
 
 - It takes a lock per checkout (git toplevel), since agents in one checkout often share a test
   database or build output, then one of N machine-wide slots. The user sets N; agents must not
   change it with `deli --slots N`, even when the queue is slow.
+- Commands measured light on this machine (`deli inspect`) skip the slot and run at once.
 - Locks die with the process, so a killed run never leaves a stale lock.
 - The exit code is the command's own.
 
@@ -34,5 +37,9 @@ deli --slots           # the current machine-wide slot count
 3. **Put it in every sub-agent brief** that will run tests or builds, with the exact command.
 4. **A run that dies or times out with no failed assertion is load, not a defect.** Check
    `deli --status` and `uptime`, then re-run it through the queue before debugging.
-5. Keep project test caps as well (for example `--maxWorkers=1`). The queue limits how many runs
+5. **Measure commands you will run again and again.** Run the first one as
+   `deli inspect -- <command>`. If it is light on this machine, later `deli -- <command>` runs
+   from the same folder with the same arguments start at once instead of waiting for a slot.
+   Keep using `deli --` for them: deli decides, and it re-queues a command that grows.
+6. Keep project test caps as well (for example `--maxWorkers=1`). The queue limits how many runs
    overlap; the caps limit how heavy each run is.
