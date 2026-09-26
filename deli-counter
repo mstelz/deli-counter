@@ -403,40 +403,40 @@ class DemoSampler:
         t = self.start_time
         self.history = deque([
             (t - 28, Entry(
-                pid=41205, label="docs-site", command="pnpm build",
+                pid=41205, label="matzo-ball-soup", command="simmer --chicken-broth --extra-fluffy",
                 submitted=t - 55, run_start=t - 50, slot=2,
-                checkout="/home/mike/Development/docs-site"
+                checkout="/kitchen/soup-station"
             )),
             (t - 107, Entry(
-                pid=40891, label="core-utils", command="cargo test",
+                pid=40891, label="bagel-schmear", command="toast --everything-bagel --lox",
                 submitted=t - 240, run_start=t - 212, slot=1,
-                checkout="/home/mike/Development/core-utils"
+                checkout="/kitchen/bakery"
             )),
             (t - 290, Entry(
-                pid=40120, label="auth-service", command="pytest tests/test_auth.py",
+                pid=40120, label="corned-beef-hash", command="sizzle --skillet --crispy-edges",
                 submitted=t - 342, run_start=t - 341, slot=1,
-                checkout="/home/mike/Development/auth-service"
+                checkout="/kitchen/grill"
             )),
         ], maxlen=500)
 
     def sample(self):
         now = time.time()
         e1 = Entry(
-            pid=42310, label="api-service", command="cargo test --release",
+            pid=42310, label="pastrami-on-rye", command="slice --paper-thin /dev/brisket",
             submitted=self.start_time - 47, run_start=self.start_time - 42, slot=1,
-            checkout="/home/mike/Development/api-service",
+            checkout="/kitchen/prep-station",
             cpu=185.0, rss=412 * 1024 * 1024, nprocs=8
         )
         e2 = Entry(
-            pid=42405, label="web-frontend", command="pnpm --filter web test:e2e",
+            pid=42405, label="reuben-grill", command="press --swiss --sauerkraut --russian",
             submitted=self.start_time - 87, run_start=self.start_time - 75, slot=2,
-            checkout="/home/mike/Development/web-frontend",
+            checkout="/kitchen/hot-press",
             cpu=94.0, rss=285 * 1024 * 1024, nprocs=4
         )
         e3 = Entry(
-            pid=42512, label="data-pipeline", command="python -m pytest tests/unit -n auto",
+            pid=42512, label="pickle-barrel", command="ferment --garlic-dill --full-sour",
             submitted=self.start_time - 20, run_start=self.start_time - 18, slot=3,
-            checkout="/home/mike/Development/data-pipeline",
+            checkout="/kitchen/brine-vat",
             cpu=240.0, rss=620 * 1024 * 1024, nprocs=6
         )
         slots = {}
@@ -451,14 +451,14 @@ class DemoSampler:
                 slots[i] = None
 
         w1 = Entry(
-            pid=42601, label="worker-service", command="cargo build --release",
+            pid=42601, label="triple-decker", command="stack --club --toothpicks=frilly",
             submitted=self.start_time - 35, checkout_wait=False,
-            checkout="/home/mike/Development/worker-service"
+            checkout="/kitchen/assembly"
         )
         w2 = Entry(
-            pid=42680, label="api-service", command="cargo clippy --all-targets",
+            pid=42680, label="hold-the-mayo", command="spread --spicy-brown-mustard-only",
             submitted=self.start_time - 14, checkout_wait=True,
-            checkout="/home/mike/Development/api-service", blocked_by=1
+            checkout="/kitchen/prep-station", blocked_by=1
         )
         waiting = [w1, w2]
 
