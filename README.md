@@ -11,9 +11,23 @@ This is a small fix for that:
 
 ![deli-counter](screenshots/deli-counter.png)
 
-Works on Linux and macOS. It needs bash, `flock` and python3 (for the dashboard only). Linux
-has `flock` already; on macOS the installer offers to `brew install flock` for you. Nothing
-else to install: the dashboard only uses Python's standard library.
+Works on Linux and macOS. On macOS the only thing you may need to add is `flock`, and the
+installer offers to `brew install flock` for you.
+
+## Requirements
+
+Each part needs a little more than the one before. Apart from `flock` on macOS, and `curses`
+on some minimal Linux images, all of it ships with Linux and macOS.
+
+| Part | Needs | Without it |
+| --- | --- | --- |
+| `deli` (the queue) | bash 3.2 or later, `flock`, and the usual shell tools (`sha1sum` or `shasum`, `seq`, `sed`, `readlink`). `git` is optional. | No `flock`: deli won't start. Install it on macOS with `brew install flock`; on Linux it's in util-linux. No `git`: the checkout lock is keyed on the current folder instead of the repo root. |
+| `deli-counter` (the dashboard) | python3 3.8 or later, with the standard `curses` module. On macOS it also calls `ps`, `lsof`, `sysctl` and `vm_stat`. | The dashboard won't run. `deli` still works. |
+| `deli inspect`, skip light and auto-measure | The same python3 as the dashboard. `deli-inspect` must sit next to `deli-counter`, because it borrows the dashboard's process readings. On macOS it also calls `ioreg` for the machine id. | deli queues every command and never measures anything. `deli inspect` exits with an error naming what's missing. |
+
+No Python packages to install: both Python tools use only the standard library. Some minimal
+Linux images ship Python without `curses`. If `python3 -c 'import curses'` fails, install your
+distribution's curses package for Python.
 
 On Windows, use it inside [WSL](https://learn.microsoft.com/windows/wsl/install). A native
 Windows version would mean rewriting both tools as a single compiled program, which I'll do if
@@ -131,7 +145,8 @@ How profiles are kept:
   runs. At most 1000 profiles are kept, most recently used first. Each profile holds at most 5
   small records, so the file stays small even with auto-measure on.
 
-`deli inspect` needs python3. Without it, deli queues everything as it always has.
+`deli inspect` needs python3 (see [Requirements](#requirements)). Without it, deli queues
+everything as it always has.
 
 Environment variables, if you need them: `DELI_QUEUE_DIR` (where the queue keeps its files,
 default `/tmp/deli-queue`), `DELI_QUEUE_SLOTS` (starting slot count if you never set one),

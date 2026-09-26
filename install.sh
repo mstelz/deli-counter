@@ -106,7 +106,7 @@ A native Windows build may come later if people ask for it:
   *) die "unsupported system: $OS (Linux and macOS only)" ;;
 esac
 command -v python3 >/dev/null ||
-  say "note: python3 is missing. deli works without it; deli-counter needs it."
+  say "note: python3 is missing. deli works without it; deli-counter and deli inspect need it."
 
 # Run from a clone: use it. Piped from curl: there is no script file, so clone or update.
 SRC=""
