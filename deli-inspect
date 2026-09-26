@@ -7,7 +7,8 @@ A profile is one command (its exact arguments) run from one folder. Each measure
 its wall time, CPU time, peak cores and peak memory of the whole process tree. Profiles are
 kept per machine, in $DELI_STATE_DIR (default ~/.local/state/deli)/profiles-<machine>.json,
 where <machine> is a short hash of the machine id. That way a home folder shared between
-machines never mixes a laptop's numbers with a workstation's.
+machines never mixes a laptop's numbers with a workstation's. Runs older than PRUNE_DAYS age
+out, a profile with no runs left is dropped, and at most MAX_PROFILES are kept, newest first.
 
 The class is worked out when it is read, from the worst of the last few successful runs,
 against this machine's size (cores and memory):
@@ -40,9 +41,10 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-STATE_DIR = os.environ.get("DELI_STATE_DIR") or os.path.join(
-    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "deli")
 KEEP_RUNS = 5  # the class is judged on the worst of these
+PRUNE_DAYS = 30
+MAX_PROFILES = 1000
+STORE_VERSION = 1  # bump when the file's shape changes; an older file is read and upgraded
 
 # Class limits, as a share of this machine. A run is light only if it is under every light
 # limit, and heavy if it is over any heavy limit.
@@ -65,6 +67,7 @@ def load_counter():
 
 
 dc = load_counter()
+STATE_DIR = dc.STATE_DIR
 
 
 # ---------------------------------------------------------------- this machine
@@ -122,16 +125,28 @@ class Store:
         except (OSError, ValueError):
             self.data = {}
         self.data.setdefault("profiles", {})
+        self.prune()  # readers too, so an aged-out run never counts
         return self
 
     def __exit__(self, *exc):
         if self.write and exc[0] is None:
+            self.data["version"] = STORE_VERSION
             self.data["machine"] = {"id": machine_id(), "host": socket.gethostname(), **machine_size()}
             tmp = f"{self.path}.{os.getpid()}"
             with open(tmp, "w") as f:
                 json.dump(self.data, f, indent=1, sort_keys=True)
             os.replace(tmp, self.path)
         self.lock.close()
+
+    def prune(self):
+        """Runs older than PRUNE_DAYS age out, then profiles left with none, then the oldest
+        profiles past MAX_PROFILES."""
+        cutoff = time.time() - PRUNE_DAYS * 86400
+        for p in self.profiles.values():
+            p["runs"] = [r for r in p["runs"] if r["at"] >= cutoff]
+        last = {k: max(r["at"] for r in p["runs"]) for k, p in self.profiles.items() if p["runs"]}
+        keep = sorted(last, key=last.get, reverse=True)[:MAX_PROFILES]
+        self.data["profiles"] = {k: self.profiles[k] for k in keep}
 
     @property
     def profiles(self):
@@ -162,12 +177,13 @@ def measure(argv):
     seen_cpu = {}  # pid -> latest CPU seconds, to add up processes that have already ended
     peak_mem = peak_cores = 0.0
     prev_total, prev_at = 0.0, start
+    wait = 0.05  # sample early once, so a short run still gets its own memory measured
     while True:
         try:
-            child.wait(timeout=interval)
+            child.wait(timeout=wait)
             break
         except subprocess.TimeoutExpired:
-            pass
+            wait = interval
         procs = dc.read_procs()
         pids = [p for p in dc.tree(child.pid, dc.children_map(procs)) if p in procs]
         peak_mem = max(peak_mem, sum(procs[p].rss for p in pids))

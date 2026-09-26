@@ -23,7 +23,9 @@ deli inspect --show -- pnpm test   # its saved class here: light, medium, heavy 
 - It takes a lock per checkout (git toplevel), since agents in one checkout often share a test
   database or build output, then one of N machine-wide slots. The user sets N; agents must not
   change it with `deli --slots N`, even when the queue is slow.
-- Commands measured light on this machine (`deli inspect`) skip the slot and run at once.
+- Commands measured light on this machine skip the slot and run at once. Two toggles control
+  this, `deli --skip-light` and `deli --auto-measure`. Like the slot count, they belong to
+  the user: read them, never set them.
 - Locks die with the process, so a killed run never leaves a stale lock.
 - The exit code is the command's own.
 

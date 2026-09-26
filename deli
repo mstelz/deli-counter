@@ -16,12 +16,16 @@
 # DELI_QUEUE_SLOTS, then 2. Waiters re-read it on every poll, so raising it lets them in at once.
 # Lowering it never stops a running command; it only keeps new runs out of the slots above N.
 #
-# Light commands skip the slot. `deli inspect -- <command>` runs a command in the queue while
-# measuring its CPU and memory (deli-inspect, next to this script), and saves a profile for this
-# machine. Once a command's worst recent run is light for this machine, `deli -- <command>` from
-# the same folder still takes the checkout lock but runs without waiting for a slot. Those runs
-# are measured too, so a command that grows past light goes back into the queue on its own.
-# DELI_FASTPATH=0 turns this off.
+# Measuring. `deli inspect -- <command>` runs a command in the queue while measuring its CPU and
+# memory (deli-inspect, next to this script), and saves a profile for this machine, keyed by
+# folder and exact arguments. Two machine-wide toggles build on that (`deli --skip-light on|off`,
+# `deli --auto-measure on|off`, or the l and m keys in deli-counter):
+#   skip-light (on by default): a command whose worst recent run is light for this machine still
+#     takes the checkout lock but skips the slot. Those runs are always measured, so a command
+#     that grows past light goes back into the queue on its own.
+#   auto-measure (off by default): every run through the queue is measured, not just inspect.
+# Each toggle is a file in $DELI_STATE_DIR (default ~/.local/state/deli), then DELI_SKIP_LIGHT /
+# DELI_AUTO_MEASURE (on or off), then the default.
 #
 # Runs on Linux and macOS (bash 3.2 or later). macOS needs flock: `brew install flock`.
 #
@@ -29,6 +33,8 @@
 #   deli [--label <text>] -- <command> [args...]
 #   deli --status
 #   deli --slots [N]       print, or set, the machine-wide slot count
+#   deli --skip-light [on|off]     print, or set, a toggle
+#   deli --auto-measure [on|off]
 #   deli inspect [--label <text>] -- <command> [args...]   run it in the queue and measure it
 #   deli inspect --show -- <command> [args...]             what is saved for it, and its class
 #   deli inspect --forget -- <command> [args...]
@@ -37,6 +43,7 @@
 set -euo pipefail
 
 QUEUE_DIR="${DELI_QUEUE_DIR:-/tmp/deli-queue}"
+STATE_DIR="${DELI_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/deli}"
 SLOTS_FILE="$QUEUE_DIR/slots"
 POLL_SECONDS="${DELI_QUEUE_POLL_SECONDS:-5}"
 mkdir -p "$QUEUE_DIR"
@@ -54,6 +61,19 @@ done
 INSPECT="$(cd "$(dirname "$self")" && pwd)/deli-inspect"
 have_inspect() { [ -x "$INSPECT" ] && command -v python3 >/dev/null; }
 
+# toggle skip-light|auto-measure: prints on or off. Keep in step with TOGGLES in deli-counter.
+toggle() {
+  local v env default
+  case "$1" in
+    skip-light) env=DELI_SKIP_LIGHT; default=on ;;
+    auto-measure) env=DELI_AUTO_MEASURE; default=off ;;
+  esac
+  for v in "$(cat "$STATE_DIR/$1" 2>/dev/null || true)" "${!env:-}"; do
+    case "$v" in on|1) echo on; return ;; off|0) echo off; return ;; esac
+  done
+  echo "$default"
+}
+
 slot_count() {
   local n
   n="$(cat "$SLOTS_FILE" 2>/dev/null || true)"
@@ -64,6 +84,7 @@ slot_count() {
 status() {
   local f i busy n
   SLOTS="$(slot_count)"
+  echo "skip-light: $(toggle skip-light) · auto-measure: $(toggle auto-measure)"
   echo "slots ($SLOTS):"
   # Slots above N that are still running (N was lowered) show until their command ends.
   n="$SLOTS"
@@ -100,6 +121,7 @@ if [ $# -eq 0 ]; then
   fi
   echo "usage: $0 [inspect] [--label <text>] -- <command> [args...]   |   $0 --status   |   $0 --slots [N]" >&2
   echo "       $0 inspect --list | --show -- <command> | --forget -- <command>" >&2
+  echo "       $0 --skip-light [on|off]   |   $0 --auto-measure [on|off]" >&2
   echo "       $0 (interactive) opens the deli-counter dashboard" >&2
   exit 2
 fi
@@ -114,6 +136,18 @@ if [ "${1:-}" = "--slots" ]; then
   exit 0
 fi
 
+case "${1:-}" in
+  --skip-light|--auto-measure)
+    name="${1#--}"
+    if [ $# -lt 2 ]; then toggle "$name"; exit 0; fi
+    case "$2" in on|off) ;; *) echo "deli: $1 takes on or off" >&2; exit 2 ;; esac
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$2" >"$STATE_DIR/$name.$$" && mv -f "$STATE_DIR/$name.$$" "$STATE_DIR/$name"
+    echo "$name: $2"
+    exit 0
+    ;;
+esac
+
 MODE=run
 if [ "${1:-}" = "inspect" ]; then
   shift
@@ -124,6 +158,8 @@ if [ "${1:-}" = "inspect" ]; then
     --forget) shift; exec "$INSPECT" forget "$@" ;;
   esac
   MODE=inspect
+elif [ "$(toggle auto-measure)" = on ] && have_inspect; then
+  MODE=measure
 fi
 
 LABEL=""
@@ -145,7 +181,7 @@ trap 'rm -f "$WAIT_FILE"' EXIT
 
 # Measured light on this machine: skip the slot (but not the checkout lock, below).
 LIGHT=""
-if [ "$MODE" = run ] && [ "${DELI_FASTPATH:-1}" != 0 ] && have_inspect; then
+if [ "$MODE" != inspect ] && [ "$(toggle skip-light)" = on ] && have_inspect; then
   LIGHT="$("$INSPECT" class -- "$@" 2>/dev/null)" || LIGHT=""
 fi
 
@@ -180,8 +216,11 @@ while :; do
       # Run as a child, not exec: fds 8 and 9 stay held by this shell until the command ends.
       set +e
       # The child must not inherit the locks, or a daemon it leaves behind would hold them.
-      if [ "$MODE" = inspect ]; then "$INSPECT" run -- "$@" 8>&- 9>&-
-      else "$@" 8>&- 9>&-; fi
+      case "$MODE" in
+        inspect) "$INSPECT" run -- "$@" 8>&- 9>&- ;;
+        measure) "$INSPECT" run --quiet -- "$@" 8>&- 9>&- ;;
+        *) "$@" 8>&- 9>&- ;;
+      esac
       rc=$?
       set -e
       : >"$QUEUE_DIR/slot-$i.info"

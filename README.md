@@ -88,10 +88,27 @@ the command in a class for this machine:
 | medium | queue it | anything between |
 | heavy | queue it | peaks at 50% of cores or more (at least 2), or 25% of memory or more |
 
-Once a command is light, `deli -- <command>` from the same folder runs it straight away. It
-still takes the checkout lock, so it never overlaps another run in the same checkout. Those runs
-are measured too, so a test suite that grows past light goes back into the queue by itself. Set
-`DELI_FASTPATH=0` to queue everything as before.
+### Two toggles
+
+Both are machine-wide. Flip them with the `l` and `m` keys in deli-counter, or from the shell:
+
+```bash
+deli --skip-light off      # on (default) or off; no value prints the current setting
+deli --auto-measure on     # on or off (default)
+```
+
+- **skip light** (on by default). Once a command is light, `deli -- <command>` from the same
+  folder runs it straight away. It still takes the checkout lock, so it never overlaps another
+  run in the same checkout. These runs are always measured, so a test suite that grows past
+  light goes back into the queue by itself. Turn it off to queue everything, as before.
+- **auto-measure** (off by default). Every run through the queue is measured, not just
+  `deli inspect` runs, so commands get a class without anyone asking. A new command still
+  queues on its first run; only later runs can skip. With it off, only `deli inspect` adds
+  profiles.
+
+Each toggle is a file in `~/.local/state/deli` (`skip-light`, `auto-measure`) holding `on` or
+`off`, so it survives a reboot. deli reads it when a run starts; runs already going are not
+changed. With no file, `DELI_SKIP_LIGHT` and `DELI_AUTO_MEASURE` (`on`/`off`) set the value.
 
 How profiles are kept:
 
@@ -102,19 +119,25 @@ How profiles are kept:
   worked out each time from the current core count and memory. So 6 GB of peak memory is heavy
   on a 16 GB laptop but under the light limit on a 128 GB workstation, and a hardware upgrade
   reclassifies everything with no re-measuring.
-- **Keyed by folder and exact arguments.** `npm test` at the repo root and in `packages/core`
-  are separate profiles, and so are `npm test` and `npm test -- foo.test.ts`.
+- **Keyed by folder and exact arguments.** The key is the full path of the folder the command
+  runs in, plus its exact arguments. So `vitest run` in a project with 8000 tests and in one with
+  30 tests are two profiles with their own classes, and so are `vitest run` at a repo root and in
+  `packages/core`, or `vitest run` and `vitest run foo.test.ts`. Environment variables are not
+  part of the key.
 - **Worst of the last 5 good runs.** A warm-cache build can look light next to a cold one, so
   one heavy run is enough to keep a command queued. Failed runs aren't saved: a run that stops
   early looks lighter than it is.
+- **Old numbers age out.** Runs older than 30 days are dropped, then any profile left with no
+  runs. At most 1000 profiles are kept, most recently used first. Each profile holds at most 5
+  small records, so the file stays small even with auto-measure on.
 
 `deli inspect` needs python3. Without it, deli queues everything as it always has.
 
 Environment variables, if you need them: `DELI_QUEUE_DIR` (where the queue keeps its files,
 default `/tmp/deli-queue`), `DELI_QUEUE_SLOTS` (starting slot count if you never set one),
 `DELI_QUEUE_POLL_SECONDS` (how often waiting runs check for a slot, default 5), `DELI_STATE_DIR`
-(where profiles are kept, default `~/.local/state/deli`), `DELI_FASTPATH=0` (never skip the
-slot).
+(where profiles and toggles are kept, default `~/.local/state/deli`), `DELI_SKIP_LIGHT` and
+`DELI_AUTO_MEASURE` (a toggle's value when its file doesn't exist).
 
 ## Getting agents to use it
 
@@ -139,13 +162,16 @@ deli-counter --once    # print a snapshot and exit
 
 The top line shows slots in use, how many runs are waiting, load, and free memory. The line
 under it tells you in plain words whether the machine has room for more slots or is already
-overloaded. Press `?` in the dashboard for what every number means.
+overloaded. The third line shows the two toggles. Press `?` in the dashboard for what every
+number means.
 
 Keys:
 
 | key | does |
 | --- | --- |
 | `+` / `-` | more or fewer slots (for the whole machine) |
+| `l` | skip light on or off (for the whole machine) |
+| `m` | auto-measure on or off (for the whole machine) |
 | `Tab` | move into the finished list; arrows to scroll, `Enter` for details, `Esc` to leave |
 | `[` / `]` | update the screen faster or slower |
 | `r` | update now |
@@ -161,5 +187,6 @@ Everything is plain files in `/tmp/deli-queue`. Each slot is a lock file (`slot-
 that a run holds with `flock` while its command runs, plus an info file saying who has it.
 Waiting runs write a `wait-<pid>.info` file and check for a free slot every few seconds. The
 slot count is in a file called `slots`. The dashboard reads those files plus process info
-(`/proc` on Linux, `ps` and `lsof` on macOS), and the only thing it ever writes is the `slots`
-file.
+(`/proc` on Linux, `ps` and `lsof` on macOS), and the only things it ever writes are the `slots`
+file and the two toggle files. Command profiles live apart from the queue, in
+`~/.local/state/deli`, because they must outlast a reboot.

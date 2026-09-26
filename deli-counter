@@ -6,9 +6,13 @@ deli keeps its state as plain files in $DELI_QUEUE_DIR (default /tmp/deli-queue)
   wait-P.info    the same line for a queued run, suffixed " (checkout)" when it waits on its
                  own checkout's lock rather than on a machine-wide slot
   slots          the live slot count, if set; deli re-reads it on every poll
+Two on/off toggles live in $DELI_STATE_DIR (default ~/.local/state/deli), next to the command
+profiles, so they survive a reboot:
+  skip-light     commands measured light on this machine run without waiting for a slot
+  auto-measure   every run through the queue is measured, so profiles build up by themselves
 A killed run can leave either file behind, so an entry counts only while its pid is alive and
-is still a deli process. The dashboard never touches the locks. The one thing it writes is
-the slots file, when you change the slot count.
+is still a deli process. The dashboard never touches the locks. The only things it writes are
+the slots file and the two toggles, when you change them.
 
 Beyond what `deli --status` prints, it measures real run and wait times, the CPU and
 memory of each run's whole process tree, machine load and memory, and a history of runs that
@@ -16,6 +20,7 @@ finished while the dashboard was open. Linux and macOS; Python 3 standard librar
 
 Usage: deli-counter [--interval SECONDS] [--once]
 Keys:  ? help · q quit · r refresh now · + / - slot count · [ / ] refresh interval
+       l skip-light on/off · m auto-measure on/off
        Tab browse finished runs (↑↓ PgUp PgDn Home End, Enter details, Esc back)
 """
 
@@ -34,6 +39,10 @@ QUEUE_DIR = os.environ.get("DELI_QUEUE_DIR", "/tmp/deli-queue")
 SLOTS_FILE = os.path.join(QUEUE_DIR, "slots")
 DEFAULT_SLOTS = int(os.environ.get("DELI_QUEUE_SLOTS", "2"))
 MAX_SLOTS = 64
+STATE_DIR = os.environ.get("DELI_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "deli")
+# name -> (environment variable, default). deli reads these the same way on every run.
+TOGGLES = {"skip-light": ("DELI_SKIP_LIGHT", True), "auto-measure": ("DELI_AUTO_MEASURE", False)}
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 NCPU = os.cpu_count() or 1
@@ -307,6 +316,26 @@ def highest_slot():
     return n
 
 
+def toggle(name):
+    """On or off, read as deli reads it: the file in STATE_DIR, then its variable, then default."""
+    env, default = TOGGLES[name]
+    for text in (read_file(os.path.join(STATE_DIR, name)).strip(), os.environ.get(env, "")):
+        if text in ("on", "1"):
+            return True
+        if text in ("off", "0"):
+            return False
+    return default
+
+
+def set_toggle(name, on):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, name)
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write("on\n" if on else "off\n")
+    os.replace(tmp, path)
+
+
 @dataclass
 class Snapshot:
     at: float
@@ -315,6 +344,7 @@ class Snapshot:
     waiting: list
     machine: dict
     ok: bool = True
+    toggles: dict = field(default_factory=dict)  # name -> on
 
 
 @dataclass
@@ -388,7 +418,8 @@ class Sampler:
         self.running = live
         forget_checkouts(procs)
         self.prev_cpu, self.prev_at = cpu_now, now
-        return Snapshot(now, nslots, slots, waiting, machine(), ok)
+        return Snapshot(now, nslots, slots, waiting, machine(), ok,
+                        {name: toggle(name) for name in TOGGLES})
 
 
 @dataclass
@@ -398,6 +429,7 @@ class DemoSampler:
     finished: int = 3
     history: deque = field(default_factory=deque)
     start_time: float = field(default_factory=time.time)
+    toggles: dict = field(default_factory=lambda: {"skip-light": True, "auto-measure": False})
 
     def __post_init__(self):
         t = self.start_time
@@ -469,7 +501,7 @@ class DemoSampler:
             "swap_used": int(1.1 * 1024 * 1024 * 1024),
             "swap_total": 8 * 1024 * 1024 * 1024,
         }
-        return Snapshot(now, self.nslots, slots, waiting, mach, ok=True)
+        return Snapshot(now, self.nslots, slots, waiting, mach, ok=True, toggles=dict(self.toggles))
 
 
 # ---------------------------------------------------------------- formatting
@@ -538,6 +570,11 @@ HELP = [
     [("  mem avail     ", ""), ("memory that can be handed out without swapping. Yellow under 25%.", "dim")],
     [("  swap          ", ""), ("memory pushed to disk. Heavy swapping makes everything crawl.", "dim")],
     [("  second line   ", ""), ("reads those numbers for you and says whether to change the slots.", "dim")],
+    [("  skip light    ", ""), ("on: commands measured light on this machine (deli inspect) run at", "dim")],
+    [("                ", ""), ("once instead of waiting for a slot. They are still measured, so one", "dim")],
+    [("                ", ""), ("that grows past light goes back into the queue.", "dim")],
+    [("  auto-measure  ", ""), ("on: every run through the queue is measured too, so commands get a", "dim")],
+    [("                ", ""), ("class without deli inspect. Off by default.", "dim")],
     [(" SLOTS", "title")],
     [("  ran / queued  ", ""), ("how long the command has run, and how long it waited first.", "dim")],
     [("  cpu           ", ""), ("% of one core, summed over the job's processes (800% = 8 cores).", "dim")],
@@ -545,6 +582,8 @@ HELP = [
     [(" KEYS", "title")],
     [("  + / -         ", ""), ("raise or lower the slot limit, machine-wide. Running jobs never stop;", "dim")],
     [("                ", ""), ("waiters see a new limit within a few seconds.", "dim")],
+    [("  l / m         ", ""), ("turn skip light / auto-measure on or off, machine-wide. deli reads", "dim")],
+    [("                ", ""), ("them when a run starts; runs already going are not changed.", "dim")],
     [("  [ / ]         ", ""), ("refresh the dashboard more or less often (display only).", "dim")],
     [("  r             ", ""), ("refresh now.", "dim")],
     [("  Tab           ", ""), ("browse finished runs: arrows, PgUp/PgDn, Home/End, Enter for details.", "dim")],
@@ -582,6 +621,13 @@ def top_rows(snap):
     ])
     text, style = advice(snap, busy)
     rows.append([(" ", ""), (text, style)])
+    if snap.toggles:
+        on = snap.toggles
+        rows.append([
+            (" skip light ", "dim"), ("on" if on["skip-light"] else "off", "free" if on["skip-light"] else "dim"),
+            ("  auto-measure ", "dim"), ("on" if on["auto-measure"] else "off", "free" if on["auto-measure"] else "dim"),
+            ("   (l / m to change)", "dim"),
+        ])
     if not snap.ok:
         rows.append([(f" queue dir {QUEUE_DIR} does not exist yet (nothing has queued)", "warn")])
     rows.append([])
@@ -813,8 +859,8 @@ def run_curses(stdscr, interval, demo=False):
         elif view.focus:
             footer = " ↑↓ move · PgUp/PgDn · Home/End · Enter details · Esc/Tab back · q quit "
         else:
-            footer = (f" ? help · q quit · r refresh now · + - slots: {snap.nslots} · [ ] refresh every {interval:g}s"
-                      f" · Tab finished · {QUEUE_DIR} ")
+            footer = (f" ? help · q quit · r refresh now · + - slots: {snap.nslots} · l m toggles"
+                      f" · [ ] refresh every {interval:g}s · Tab finished · {QUEUE_DIR} ")
         try:
             stdscr.addstr(h - 1, 0, footer[: w - 1], curses.A_REVERSE)
         except curses.error:
@@ -851,6 +897,20 @@ def run_curses(stdscr, interval, demo=False):
                         flash = f"could not write {SLOTS_FILE}: {err.strerror}"
             else:
                 flash = f"slots already at {'minimum' if new == 1 else 'maximum'} ({new})"
+            flash_until = time.time() + 2.5
+            refresh = True
+        elif key in (ord("l"), ord("L"), ord("m"), ord("M")):
+            name = "skip-light" if key in (ord("l"), ord("L")) else "auto-measure"
+            new = not (sampler.toggles[name] if demo else toggle(name))
+            if demo:
+                sampler.toggles[name] = new
+                flash = f"{name} {'on' if new else 'off'} (demo mode)"
+            else:
+                try:
+                    set_toggle(name, new)
+                    flash = f"{name} {'on' if new else 'off'} (machine-wide; from the next run)"
+                except OSError as err:
+                    flash = f"could not write {os.path.join(STATE_DIR, name)}: {err.strerror}"
             flash_until = time.time() + 2.5
             refresh = True
         elif key == ord("]"):
