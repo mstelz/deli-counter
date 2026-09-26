@@ -1,4 +1,4 @@
-# deli-counter
+# 🥪 deli-counter
 
 I run a lot of coding agents on one machine. They all start test runs and builds at the same
 time, the machine runs out of CPU and memory, and half the runs get killed partway through.
