@@ -23,9 +23,12 @@ on some minimal Linux images, all of it ships with Linux and macOS.
 | --- | --- | --- |
 | `deli` (the queue) | bash 3.2 or later, `flock`, and the usual shell tools (`sha1sum` or `shasum`, `seq`, `sed`, `readlink`). `git` is optional. | No `flock`: deli won't start. Install it on macOS with `brew install flock`; on Linux it's in util-linux. No `git`: the checkout lock is keyed on the current folder instead of the repo root. |
 | `deli-counter` (the dashboard) | python3 3.8 or later, with the standard `curses` module. On macOS it also calls `ps`, `lsof`, `sysctl` and `vm_stat`. | The dashboard won't run. `deli` still works. |
-| `deli inspect`, skip light and auto-measure | The same python3 as the dashboard. `deli-inspect` must sit next to `deli-counter`, because it borrows the dashboard's process readings. On macOS it also calls `ioreg` for the machine id. | deli queues every command and never measures anything. `deli inspect` exits with an error naming what's missing. |
+| `deli inspect`, skip light and auto-measure | python3 3.8 or later; curses is only needed for the interactive dashboard. `deli-inspect` must sit next to `deli-counter`, because it borrows the dashboard's process readings. On macOS it also calls `ioreg` for the machine id. | deli queues every command and never measures anything. `deli inspect` exits with an error naming what's missing. |
 
-No Python packages to install: both Python tools use only the standard library. Some minimal
+FIFO admission, memory reservations and the light-run allowance also require Python and
+`deli-scheduler` next to `deli`.
+
+No Python packages to install: all Python tools use only the standard library. Some minimal
 Linux images ship Python without `curses`. If `python3 -c 'import curses'` fails, install your
 distribution's curses package for Python.
 
@@ -74,12 +77,25 @@ deli              # running with no arguments opens the deli-counter dashboard
 
 A few details:
 
+- With Python available, commands get ordered tickets. Each checkout admits its oldest
+  waiting command first; commands holding their checkout lock enter a FIFO lane for heavy
+  slots or the light allowance. A blocked checkout does not hold up unrelated checkouts.
+- Admission reserves 120% of a command's worst measured peak memory. Unknown commands reserve
+  25% of the machine's RAM. Combined reservations must fit within 90% of RAM, and available
+  memory must cover the next command, unfinished growth of active commands, and the remaining
+  10% headroom. Already resident memory is not counted twice. These estimates reduce the risk
+  of overload; they do not enforce a memory limit on a running command.
+- Light commands share an allowance of two concurrent runs, separate from the heavy slots.
+  They also obey memory admission and checkout locks. The terminal, status command and
+  dashboard explain whether a command is waiting for its checkout, its turn, memory, a slot,
+  or the light allowance.
 - Two runs in the same git checkout never overlap, even if slots are free. Agents in one
   checkout often share a test database or build folder.
 - The locks go away when the process dies, even if it's killed, so a crashed run never jams
   the queue.
 - Changing the slot count takes effect within a few seconds. Lowering it doesn't stop anything
-  already running; those runs just finish.
+  already running; those runs just finish. With Python, new work waits until the total
+  number of occupied slots falls below the new limit.
 
 ## Measuring a command: deli inspect
 
@@ -90,6 +106,7 @@ still be waiting in line. `deli inspect` measures a command on this machine, so 
 deli inspect -- npm test            # runs in the queue as usual, then prints what it used
 deli inspect --show -- npm test     # what's saved for it, and its class here
 deli inspect --list                 # everything measured on this machine
+deli inspect --storage              # prune old data and show bytes, profiles and runs
 deli inspect --forget -- npm test
 ```
 
@@ -98,7 +115,7 @@ the command in a class for this machine:
 
 | class | means | limits (share of this machine) |
 | --- | --- | --- |
-| light | runs without waiting for a slot | under 15 s CPU, under 10% of cores on average (at least 1), peaks under 25% of cores (at least 2), under 5% of memory |
+| light | uses the shared light allowance instead of a heavy slot | under 15 s CPU, under 10% of cores on average (at least 1), peaks under 25% of cores (at least 2), under 5% of memory |
 | medium | queue it | anything between |
 | heavy | queue it | peaks at 50% of cores or more (at least 2), or 25% of memory or more |
 
@@ -112,9 +129,9 @@ deli --auto-measure on     # on or off (default)
 ```
 
 - **skip light** (on by default). Once a command is light, `deli -- <command>` from the same
-  folder runs it straight away. It still takes the checkout lock, so it never overlaps another
-  run in the same checkout. These runs are always measured, so a test suite that grows past
-  light goes back into the queue by itself. Turn it off to queue everything, as before.
+  folder can run without a heavy slot, subject to the shared light allowance and memory. It
+  still takes the checkout lock, so it never overlaps another run in the same checkout. These
+  runs are always measured, so a test suite that grows past light goes back into the queue by itself. Turn it off to queue everything, as before.
 - **auto-measure** (off by default). Every run through the queue is measured, not just
   `deli inspect` runs, so commands get a class without anyone asking. A new command still
   queues on its first run; only later runs can skip. With it off, only `deli inspect` adds
@@ -143,10 +160,27 @@ How profiles are kept:
   early looks lighter than it is.
 - **Old numbers age out.** Runs older than 30 days are dropped, then any profile left with no
   runs. At most 1000 profiles are kept, most recently used first. Each profile holds at most 5
-  small records, so the file stays small even with auto-measure on.
+  small records, so the file stays small even with auto-measure on. Limits are enforced before
+  every save. Interrupted temporary writes are removed on the next write or storage inspection.
+  Profile-save or sampling errors produce a warning and preserve the command's exit code.
 
 `deli inspect` needs python3 (see [Requirements](#requirements)). Without it, deli queues
 everything as it always has.
+
+Scheduling settings, inherited by each invocation:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DELI_LIGHT_SLOTS` | `2` | Maximum concurrent light runs. Use the same setting across callers. |
+| `DELI_MEMORY_FRACTION` | `0.9` | Fraction of RAM available for reservations; the remainder is headroom. Use the same setting across callers. |
+| `DELI_MEMORY_CHECK` | `on` | Explicitly set `off` to use slot/allowance limits without memory admission. |
+
+A profile whose estimated requirement exceeds the entire memory budget is rejected with exit
+code 75 and an explanation, rather than waiting forever. Inspect or forget an obsolete
+profile, or explicitly override memory admission for that invocation. Other memory waits are
+rechecked at the normal polling interval. With no memory readings, slot limits still apply.
+Without Python, the original shell queue remains available, with polling rather than FIFO
+admission and without memory reservations or light bypasses.
 
 Environment variables, if you need them: `DELI_QUEUE_DIR` (where the queue keeps its files,
 default `/tmp/deli-queue`), `DELI_QUEUE_SLOTS` (starting slot count if you never set one),
@@ -200,8 +234,18 @@ shorter than a second or so.
 
 Everything is plain files in `/tmp/deli-queue`. Each slot is a lock file (`slot-1.lock`, ...)
 that a run holds with `flock` while its command runs, plus an info file saying who has it.
-Waiting runs write a `wait-<pid>.info` file and check for a free slot every few seconds. The
-slot count is in a file called `slots`. The dashboard reads those files plus process info
+Waiting runs write a `wait-<pid>.info` file and check admission every few seconds. With Python,
+`job-<pid>.json` files hold tickets and memory reservations, guarded by an admission lock.
+Each live job holds a lock on its metadata; unlocked files are removed as stale, so PID reuse
+cannot keep an abandoned ticket alive. Wait reasons live in `wait-<pid>.reason`; active light
+runs have their own allowance locks and `light-<pid>.info` files. The slot count is in `slots`. The dashboard reads those files plus process info
 (`/proc` on Linux, `ps` and `lsof` on macOS), and the only things it ever writes are the `slots`
 file and the two toggle files. Command profiles live apart from the queue, in
 `~/.local/state/deli`, because they must outlast a reboot.
+
+## Reliability checks
+
+Run `python3 -m unittest discover -s tests -v`. The suite uses isolated temporary queue and
+profile directories and covers concurrent scheduling, checkout exclusion, cancellation,
+crashed waiters, slot changes, bounded light runs, memory admission, profile retention and
+measurement failures.

@@ -25,7 +25,11 @@ Keys:  ? help · q quit · r refresh now · + / - slot count · [ / ] refresh in
 """
 
 import argparse
-import curses
+import glob
+try:
+    import curses
+except ImportError:
+    curses = None  # process readings and noninteractive output do not need curses
 import os
 import re
 import subprocess
@@ -257,6 +261,7 @@ class Entry:
     label: str
     command: str
     submitted: float  # when deli started (epoch)
+    reason: str = ""
     checkout_wait: bool = False
     slot: int = 0
     run_start: float = 0.0  # when the command itself started (epoch), slots only
@@ -345,6 +350,7 @@ class Snapshot:
     machine: dict
     ok: bool = True
     toggles: dict = field(default_factory=dict)  # name -> on
+    light: list = field(default_factory=list)
 
 
 @dataclass
@@ -388,6 +394,14 @@ class Sampler:
             elif i <= nslots:
                 slots[i] = None
 
+        light = []
+        for path in glob.glob(os.path.join(QUEUE_DIR, 'light-*.info')):
+            info = parse_info(read_file(path))
+            if info and info[0] in procs and is_deli(info[0], procs):
+                pid, label, cmd, _ = info
+                e = Entry(pid, label, cmd, procs[pid].start, checkout=checkout_of(pid) or "")
+                measure(e)
+                light.append(e)
         waiting = []
         try:
             names = os.listdir(QUEUE_DIR) if ok else []
@@ -404,13 +418,14 @@ class Sampler:
                 continue  # between taking a slot and removing its wait file
             e = Entry(pid, label, cmd, procs[pid].start, checkout_wait=checkout,
                       checkout=checkout_of(pid) or "")
+            e.reason = read_file(os.path.join(QUEUE_DIR, f"wait-{pid}.reason")).strip()
             if checkout:
                 e.blocked_by = next((s.slot for s in slots.values()
                                      if s and s.checkout and s.checkout == e.checkout), 0)
             waiting.append(e)
         waiting.sort(key=lambda e: e.submitted)
 
-        live = {e.pid: e for e in slots.values() if e}
+        live = {e.pid: e for e in list(slots.values()) + light if e}
         for pid, e in self.running.items():
             if pid not in live:
                 self.history.appendleft((now, e))
@@ -419,7 +434,7 @@ class Sampler:
         forget_checkouts(procs)
         self.prev_cpu, self.prev_at = cpu_now, now
         return Snapshot(now, nslots, slots, waiting, machine(), ok,
-                        {name: toggle(name) for name in TOGGLES})
+                        {name: toggle(name) for name in TOGGLES}, light)
 
 
 @dataclass
@@ -663,8 +678,14 @@ def top_rows(snap):
         rows.append([("      ", ""), (e.command, "dim")])
     rows.append([])
 
+    if snap.light:
+        rows.append([(" LIGHT RUNS", "title")])
+        for e in snap.light:
+            rows.append([(f"  {e.label} · {e.rss / 1024**2:.0f} MB · pid {e.pid}", "free")])
+            rows.append([("      " + e.command, "dim")])
+        rows.append([])
     rows.append([(f" WAITING ({len(snap.waiting)})", "title"),
-                 ("   oldest first; slot waiters poll every few seconds, so order is a guide", "dim")])
+                 ("   FIFO within each lane after the checkout lock", "dim")])
     if not snap.waiting:
         rows.append([("  nothing queued", "dim")])
     for n, e in enumerate(snap.waiting, 1):
@@ -673,7 +694,7 @@ def top_rows(snap):
             (f"{e.label:<24.24} ", "wait"),
             ("waiting ", "dim"), (f"{dur(snap.at - e.submitted):>7}", ""),
             ("  on ", "dim"),
-            ("a slot" if not e.checkout_wait
+            (e.reason if e.reason else "a slot" if not e.checkout_wait
              else f"its checkout (slot {e.blocked_by})" if e.blocked_by
              else "its checkout", "check" if e.checkout_wait else ""),
             (f"  pid {e.pid}", "dim"),
@@ -954,6 +975,8 @@ def main():
     if args.once or not sys.stdout.isatty():
         print_once(demo=args.demo)
         return
+    if curses is None:
+        sys.exit("deli-counter: interactive display needs Python curses; try --once")
     os.environ.setdefault("ESCDELAY", "25")
     try:
         curses.wrapper(run_curses, max(0.25, args.interval), args.demo)

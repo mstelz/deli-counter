@@ -22,11 +22,13 @@ Usage:
   deli-inspect class -- <command> [args...]           print the class; exit 0 only if light
   deli-inspect show -- <command> [args...]            print the saved profile
   deli-inspect forget -- <command> [args...]          delete the saved profile
+  deli-inspect storage                                prune and show storage usage
   deli-inspect list                                   every profile on this machine
 Commands are looked up by the current folder plus their exact arguments.
 """
 
 import fcntl
+import glob
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -118,32 +120,50 @@ class Store:
     def __enter__(self):
         os.makedirs(STATE_DIR, exist_ok=True)
         self.lock = open(self.path + ".lock", "w")
-        fcntl.flock(self.lock, fcntl.LOCK_EX if self.write else fcntl.LOCK_SH)
         try:
-            with open(self.path) as f:
-                self.data = json.load(f)
-        except (OSError, ValueError):
-            self.data = {}
-        self.data.setdefault("profiles", {})
-        self.prune()  # readers too, so an aged-out run never counts
+            fcntl.flock(self.lock, fcntl.LOCK_EX if self.write else fcntl.LOCK_SH)
+            try:
+                with open(self.path) as f:
+                    self.data = json.load(f)
+            except (OSError, ValueError):
+                self.data = {}
+            self.data.setdefault("profiles", {})
+            self.prune()  # readers too, so an aged-out run never counts
+        except Exception:
+            self.lock.close()
+            raise
         return self
 
     def __exit__(self, *exc):
+        try:
+            self.commit(exc)
+        finally:
+            self.lock.close()
+
+    def commit(self, exc):
         if self.write and exc[0] is None:
+            self.prune()
+            # The store lock excludes other writers, so these are interrupted writes.
+            for old in glob.glob(self.path + ".*"):
+                if old.rsplit(".", 1)[-1].isdigit():
+                    os.unlink(old)
             self.data["version"] = STORE_VERSION
             self.data["machine"] = {"id": machine_id(), "host": socket.gethostname(), **machine_size()}
             tmp = f"{self.path}.{os.getpid()}"
-            with open(tmp, "w") as f:
-                json.dump(self.data, f, indent=1, sort_keys=True)
-            os.replace(tmp, self.path)
-        self.lock.close()
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(self.data, f, indent=1, sort_keys=True)
+                os.replace(tmp, self.path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
 
     def prune(self):
         """Runs older than PRUNE_DAYS age out, then profiles left with none, then the oldest
         profiles past MAX_PROFILES."""
         cutoff = time.time() - PRUNE_DAYS * 86400
         for p in self.profiles.values():
-            p["runs"] = [r for r in p["runs"] if r["at"] >= cutoff]
+            p["runs"] = [r for r in p["runs"] if r["at"] >= cutoff][-KEEP_RUNS:]
         last = {k: max(r["at"] for r in p["runs"]) for k, p in self.profiles.items() if p["runs"]}
         keep = sorted(last, key=last.get, reverse=True)[:MAX_PROFILES]
         self.data["profiles"] = {k: self.profiles[k] for k in keep}
@@ -172,7 +192,12 @@ def measure(argv):
         return 127, None
     # Ctrl-C reaches the child through the terminal; we wait for it and report its exit code.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, lambda *_: child.terminate())
+    def terminate(*_):
+        try:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+    signal.signal(signal.SIGTERM, terminate)
 
     seen_cpu = {}  # pid -> latest CPU seconds, to add up processes that have already ended
     peak_mem = peak_cores = 0.0
@@ -184,17 +209,27 @@ def measure(argv):
             break
         except subprocess.TimeoutExpired:
             wait = interval
-        procs = dc.read_procs()
-        pids = [p for p in dc.tree(child.pid, dc.children_map(procs)) if p in procs]
-        peak_mem = max(peak_mem, sum(procs[p].rss for p in pids))
-        for p in pids:
-            seen_cpu[p] = procs[p].cpu
-        total, now = sum(seen_cpu.values()), time.time()
-        peak_cores = max(peak_cores, (total - prev_total) / max(now - prev_at, 1e-3))
-        prev_total, prev_at = total, now
+        try:
+            procs = dc.read_procs()
+            pids = [p for p in dc.tree(child.pid, dc.children_map(procs)) if p in procs]
+            peak_mem = max(peak_mem, sum(procs[p].rss for p in pids))
+            for p in pids:
+                seen_cpu[p] = procs[p].cpu
+            total, now = sum(seen_cpu.values()), time.time()
+            peak_cores = max(peak_cores, (total - prev_total) / max(now - prev_at, 1e-3))
+            prev_total, prev_at = total, now
+        except Exception as e:
+            print(f"deli: measurement unavailable: {e}; waiting for command to finish", file=sys.stderr)
+            rc = child.wait()
+            return (128 - rc if rc < 0 else rc), None
     wall = time.time() - start
 
-    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    try:
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except Exception as e:
+        print(f"deli: measurement unavailable: {e}", file=sys.stderr)
+        rc = child.returncode
+        return (128 - rc if rc < 0 else rc), None
     cpu = max(ru.ru_utime + ru.ru_stime, sum(seen_cpu.values()))
     # A run too short to sample: fall back to its largest single process. Only then, because on
     # Linux a child's ru_maxrss starts at this script's own size when it forks.
@@ -303,17 +338,21 @@ def cmd_run(args):
     if record is None:
         return rc
     note = ""
-    with Store(write=True) as st:
-        prof = st.profiles.setdefault(key_of(cwd, argv), {"cwd": cwd, "argv": argv, "runs": []})
-        if rc == 0:
-            prof["runs"] = (prof["runs"] + [record])[-KEEP_RUNS:]
-        else:
-            note = f"not saved: it exited {rc}, and a run that stops early looks lighter than it is"
-        if not prof["runs"]:
-            del st.profiles[key_of(cwd, argv)]
-        runs = list(prof["runs"])
-    if not quiet:
-        report(argv, cwd, runs, machine_size(), record, note)
+    runs = []
+    try:
+        with Store(write=True) as st:
+            prof = st.profiles.setdefault(key_of(cwd, argv), {"cwd": cwd, "argv": argv, "runs": []})
+            if rc == 0:
+                prof["runs"] = (prof["runs"] + [record])[-KEEP_RUNS:]
+            else:
+                note = f"not saved: it exited {rc}, and a run that stops early looks lighter than it is"
+            if not prof["runs"]:
+                del st.profiles[key_of(cwd, argv)]
+            runs = list(prof["runs"])
+        if not quiet:
+            report(argv, cwd, runs, machine_size(), record, note)
+    except Exception as e:
+        print(f"deli: measurement could not be saved/reported: {e}", file=sys.stderr)
     return rc
 
 
@@ -365,8 +404,17 @@ def cmd_list(_args):
     return 0
 
 
+def cmd_storage(_args):
+    with Store(write=True) as st:
+        count = len(st.profiles)
+        runs = sum(len(p["runs"]) for p in st.profiles.values())
+    print(f"{store_path()}\n  {os.path.getsize(store_path())} bytes · {count}/{MAX_PROFILES} profiles · {runs} runs")
+    print(f"  keeps {KEEP_RUNS} successful runs per profile, expires after {PRUNE_DAYS} days")
+    return 0
+
+
 def main():
-    cmds = {"run": cmd_run, "class": cmd_class, "show": cmd_show, "forget": cmd_forget, "list": cmd_list}
+    cmds = {"run": cmd_run, "class": cmd_class, "show": cmd_show, "forget": cmd_forget, "list": cmd_list, "storage": cmd_storage}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         print(__doc__.split("Usage:")[1].rstrip(), file=sys.stderr)
         return 2

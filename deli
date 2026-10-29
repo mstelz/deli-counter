@@ -104,6 +104,12 @@ status() {
       echo "  slot $i: $(cat "$f" 2>/dev/null || echo busy) (above limit, finishing)"
     fi
   done
+  echo "light runs:"
+  for f in "$QUEUE_DIR"/light-*.info; do
+    [ -s "$f" ] || continue
+    w_pid="$(basename "$f" .info | sed 's/^light-//')"
+    kill -0 "$w_pid" 2>/dev/null && echo "  $(cat "$f")"
+  done
   echo "waiting:"
   for f in "$QUEUE_DIR"/wait-*.info; do
     [ -e "$f" ] || continue
@@ -111,6 +117,7 @@ status() {
     w_pid="$(basename "$f" .info | sed 's/^wait-//')"
     if kill -0 "$w_pid" 2>/dev/null; then
       echo "  $(cat "$f")"
+      [ ! -f "$QUEUE_DIR/wait-$w_pid.reason" ] || cat "$QUEUE_DIR/wait-$w_pid.reason"
     fi
   done
 }
@@ -120,7 +127,7 @@ if [ $# -eq 0 ]; then
     exec deli-counter
   fi
   echo "usage: $0 [inspect] [--label <text>] -- <command> [args...]   |   $0 --status   |   $0 --slots [N]" >&2
-  echo "       $0 inspect --list | --show -- <command> | --forget -- <command>" >&2
+  echo "       $0 inspect --list | --storage | --show -- <command> | --forget -- <command>" >&2
   echo "       $0 --skip-light [on|off]   |   $0 --auto-measure [on|off]" >&2
   echo "       $0 (interactive) opens the deli-counter dashboard" >&2
   exit 2
@@ -153,6 +160,7 @@ if [ "${1:-}" = "inspect" ]; then
   shift
   have_inspect || { echo "deli: inspect needs python3 and $INSPECT" >&2; exit 127; }
   case "${1:-}" in
+    --storage) exec "$INSPECT" storage ;;
     --list) exec "$INSPECT" list ;;
     --show) shift; exec "$INSPECT" show "$@" ;;
     --forget) shift; exec "$INSPECT" forget "$@" ;;
@@ -170,6 +178,12 @@ if [ "${1:-}" != "--" ]; then
 fi
 shift
 [ $# -gt 0 ] || { echo "deli: no command given" >&2; exit 2; }
+
+# Python scheduling adds FIFO admission, memory reservations and a bounded light lane.
+SCHEDULER="$(dirname "$INSPECT")/deli-scheduler"
+if have_inspect && [ -f "$SCHEDULER" ]; then
+  exec python3 "$SCHEDULER" "$MODE" "$LABEL" "$(toggle skip-light)" -- "$@"
+fi
 
 WORKTREE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # sha1sum on Linux, shasum on macOS: the same SHA-1, so a checkout's lock name matches on both.
